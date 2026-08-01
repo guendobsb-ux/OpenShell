@@ -25,6 +25,8 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <vers
 
 ## Install on OpenShift
 
+See the full [OpenShift install guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) for details. Quick start:
+
 ```shell
 # Precreate the openshell namespace so we can create the SCC cluster role
 oc create ns openshell
@@ -151,8 +153,9 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | grpcRoute.gateway.className | string | `"eg"` | GatewayClass to reference. Envoy Gateway installs one named "eg". |
 | grpcRoute.gateway.create | bool | `false` | When true, a Gateway resource is created in the release namespace. Set to false and provide name/namespace to attach to a pre-existing Gateway. |
 | grpcRoute.gateway.listener.allowedRoutes | string | `"Same"` | "Same" restricts attached routes to the release namespace; "All" allows any namespace. |
-| grpcRoute.gateway.listener.port | int | `80` | Listener port for the generated Gateway resource. |
-| grpcRoute.gateway.listener.protocol | string | `"HTTP"` | Listener protocol for the generated Gateway resource. |
+| grpcRoute.gateway.listener.port | int | `80` | Listener port for the generated Gateway resource. Use 443 with protocol HTTPS. |
+| grpcRoute.gateway.listener.protocol | string | `"HTTP"` | Listener protocol for the generated Gateway resource: HTTP or HTTPS. HTTPS terminates TLS at the Envoy Gateway listener; pair it with server.disableTls=true so Envoy forwards plaintext to the gateway pod, and use OIDC for client identity (the gateway never sees the client cert). |
+| grpcRoute.gateway.listener.tls.certificateRefs | list | `[]` | certificateRefs for the HTTPS listener. Required when protocol is HTTPS. Each entry needs a `name` pointing at a kubernetes.io/tls Secret in the Gateway's namespace. May reference a cert-manager-issued Secret or the existing openshell-server-tls Secret (its SANs must include the external hostname). |
 | grpcRoute.gateway.name | string | `""` | Name of the Gateway resource. Defaults to the chart fullname. |
 | grpcRoute.gateway.namespace | string | `""` | Namespace of the Gateway referenced by the GRPCRoute parentRef. Defaults to the release namespace. |
 | grpcRoute.hostnames | list | `[]` | Hostnames the GRPCRoute matches on. Leave empty to match all hosts. |
@@ -211,6 +214,7 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | server.oidc.rolesClaim | string | `""` | Dot-separated path to the roles array in the JWT claims. Keycloak: "realm_access.roles", Entra ID: "roles", Okta: "groups". |
 | server.oidc.scopesClaim | string | `""` | Dot-separated path to the scopes array in the JWT claims. |
 | server.oidc.userRole | string | `""` | Role name for standard user access. |
+| server.policyValidationFailureMode | string | `"fail_closed"` | Posture when a candidate sandbox policy fails validation. `fail_closed` deactivates the previous policy; `retain_last_valid` keeps it active. |
 | server.providerTokenGrants.spiffe.enabled | bool | `false` | Mount the SPIFFE Workload API socket into sandbox pods for dynamic provider token grants. |
 | server.providerTokenGrants.spiffe.workloadApiSocketPath | string | `"/spiffe-workload-api/spire-agent.sock"` | Path to the SPIFFE Workload API socket mounted into sandbox pods. |
 | server.sandboxImage | string | `"ghcr.io/nvidia/openshell-community/sandboxes/base:latest"` | Default sandbox image used when requests do not specify one. |
@@ -226,6 +230,7 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | server.tls.clientCaSecretName | string | `"openshell-server-client-ca"` | K8s secret with ca.crt for client certificate verification (mTLS). Set to "" to disable mTLS and run HTTPS-only (use OIDC for auth instead). |
 | server.tls.clientTlsSecretName | string | `"openshell-client-tls"` | K8s secret mounted into sandbox pods for mTLS to the server. |
 | server.workspaceDefaultStorageSize | string | `""` | Default storage size for the workspace PVC in sandbox pods. Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi"). Empty = built-in default (2Gi). |
+| server.workspaceStorageClass | string | `""` | Kubernetes StorageClass for the workspace PVC in sandbox pods. Empty (default) = omit storageClassName, using the cluster's default StorageClass. Set this on clusters with no default StorageClass, otherwise the workspace PVC stays Pending and the sandbox never starts. |
 | service.healthPort | int | `8081` | Gateway health service port. |
 | service.metricsPort | int | `9090` | Gateway metrics service port. |
 | service.port | int | `8080` | Gateway gRPC/HTTP service port. |
@@ -234,9 +239,12 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | serviceAccount.create | bool | `true` | Create a service account for the gateway. |
 | serviceAccount.name | string | `""` | Existing service account name to use when serviceAccount.create is false. |
 | supervisor.image.pullPolicy | string | `""` | Supervisor image pull policy. Defaults to the gateway image pull policy when empty. |
-| supervisor.image.repository | string | `"ghcr.io/nvidia/openshell/supervisor"` | Supervisor image repository. |
-| supervisor.image.tag | string | `""` | Supervisor image tag. Defaults to the chart appVersion when empty. |
+| supervisor.image.repository | string | `"ghcr.io/nvidia/openshell/supervisor"` | Supervisor image repository. Changing it uses the effective gateway image tag unless tag is also set. |
+| supervisor.image.tag | string | `""` | Supervisor image tag override. Empty uses the version pinned into the gateway unless repository is changed. |
+| supervisor.sidecar.processBinaryAwareNetworkPolicy | bool | `true` | Keep process/binary-aware network policy enabled in sidecar topology. When false, the network sidecar runs as proxyUid, drops the extra /proc inspection capabilities, and enforces endpoint/L7 policy without matching policy.binaries. |
+| supervisor.sidecar.proxyUid | int | `1337` | UID for relaxed long-running network sidecars in sidecar topology. Strict process/binary-aware sidecars run as UID 0 so Kubernetes grants the required /proc inspection capabilities into the effective set. The network init container installs nftables rules that exempt the effective sidecar UID. |
 | supervisor.sideloadMethod | string | `""` | How the supervisor binary is delivered into sandbox pods. Empty (default) = auto-detect from cluster version:   K8s >= v1.35 -> "image-volume" (ImageVolume enabled by default; GA in v1.36)   K8s < v1.35 -> "init-container" (copies via init container + emptyDir) On K8s v1.33-v1.34 with the ImageVolume feature gate manually enabled, set this to "image-volume" explicitly. |
+| supervisor.topology | string | `"combined"` | Supervisor pod topology for Kubernetes sandboxes. "combined" runs the current single supervisor container in the agent pod. "sidecar" runs network enforcement in a dedicated sidecar and the process supervisor as a low-capability wrapper in the agent container. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
 | workload.allowMultiReplicaStatefulSet | bool | `false` | Allow replicaCount > 1 while rendering a StatefulSet. Prefer workload.kind=deployment for external database-backed multi-replica gateways; this override exists for operators who explicitly require StatefulSet identity or storage semantics. |
 | workload.kind | string | `"statefulset"` | Gateway workload controller kind. Use `statefulset` for the default SQLite database, or `deployment` when server.externalDbSecret points at an external database. |

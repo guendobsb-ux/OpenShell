@@ -25,7 +25,7 @@ Reserved built-in values are `docker`, `podman`, `kubernetes`, and `vm`.
 Non-reserved names select an extension driver and require a
 `socket_path` in `[openshell.drivers.<name>]`.
 
-When `compute_drivers` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker by CLI availability or a local Unix socket. The VM driver is never auto-detected; configure it explicitly with `compute_drivers = ["vm"]` or set `OPENSHELL_DRIVERS=vm` in the launch environment.
+When `compute_drivers` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. Local container runtimes must respond to an API probe before the gateway selects them. The VM driver is never auto-detected; configure it explicitly with `compute_drivers = ["vm"]` or set `OPENSHELL_DRIVERS=vm` in the launch environment.
 
 Common gateway options:
 
@@ -107,6 +107,16 @@ It overrides the gateway's configured default runtime class for that sandbox,
 while a typed `SandboxTemplate.runtime_class_name` value from the API still
 takes precedence.
 
+Docker and Podman callback listeners accept only supervisor callback gRPC
+methods. Use the gateway's primary endpoint for CLI, administrator, health,
+reflection, inference-route management, and HTTP requests. A
+`PermissionDenied` response from one of the sandbox-visible callback addresses
+is expected for those requests. The gateway fails startup if a callback
+requirement resolves to the exact primary listener address because one socket
+cannot preserve both authorization scopes. For the IPv4-loopback callback used
+by Podman Machine, bind the primary listener to a distinct address such as
+`[::1]:17670`.
+
 ## Docker Driver
 
 [Docker](https://www.docker.com/get-started/)-backed sandboxes run as containers on the gateway host. Use Docker for local development, single-machine gateways, and hosts that already use Docker Desktop or Docker Engine.
@@ -115,7 +125,7 @@ The gateway talks to the Docker daemon to create sandbox containers. Docker is a
 
 For maintainer-level implementation details, refer to the [Docker driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-docker/README.md).
 
-Select Docker with `compute_drivers = ["docker"]` in `[openshell.gateway]`. Configure Docker driver values such as `grpc_endpoint`, `network_name`, `supervisor_bin`, `supervisor_image`, `image_pull_policy`, `ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.docker]`.
+Select Docker with `compute_drivers = ["docker"]` in `[openshell.gateway]`. Configure Docker driver values such as `socket_path`, `grpc_endpoint`, `network_name`, `supervisor_bin`, `supervisor_image`, `image_pull_policy`, `ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.docker]`. When `socket_path` is unset, the driver uses the same responsive local socket selected by auto-detection. An explicitly selected Docker driver falls back to `/var/run/docker.sock` when no candidate responds.
 
 For GPU-backed Docker sandboxes, configure Docker CDI before starting the gateway so OpenShell can detect the daemon capability.
 
@@ -162,26 +172,31 @@ Docker mount schema:
 
 | Type | Fields |
 |---|---|
-| `bind` | `source`, `target`, optional `read_only` (`true` by default). `source` must be an absolute host path. Requires `enable_bind_mounts = true`. |
+| `bind` | `source`, `target`, optional `read_only` (`true` by default), optional `selinux_label` (`shared` for `:z` or `private` for `:Z`). `source` must be an absolute host path. Requires `enable_bind_mounts = true`. |
 | `volume` | `source`, `target`, optional `read_only` (`true` by default), optional `subpath`. The named volume must already exist. Docker local-driver bind-backed volumes require `enable_bind_mounts = true`. |
 | `tmpfs` | `target`, optional `options`, optional `size_bytes`, optional `mode`. |
 
-OpenShell rejects mount targets that replace the workspace root, container root,
-supervisor files, `/etc/openshell`, `/etc/openshell-tls`, authentication
-material, or network namespace paths. These checks do not make host bind mounts
-safe.
+OpenShell rejects mount `source`, `target`, and Docker volume `subpath` values
+with surrounding whitespace. OpenShell also rejects mount targets that replace
+the workspace root, container root, supervisor files, `/etc/openshell`,
+`/etc/openshell-tls`, authentication material, or network namespace paths. These
+checks do not make host bind mounts safe.
 
 ## Podman Driver
 
 [Podman](https://podman.io/)-backed sandboxes run as rootless containers on the gateway host. Use Podman for Linux workstation workflows that avoid a rootful Docker daemon.
 
-The gateway talks to the Podman API socket. The Podman driver requires Podman 5.x, cgroups v2, rootless networking, and an active Podman user socket.
+The gateway talks to the Podman API socket. The Podman driver requires Podman 5.x, cgroups v2, rootless networking, and an active Podman user socket. When `socket_path` is not set, the driver probes for a responsive Podman socket and fails to start if none respond.
 
 For maintainer-level implementation details, refer to the [Podman driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/README.md) and [Podman networking notes](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/NETWORKING.md).
 
 Select Podman with `compute_drivers = ["podman"]` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, `host_gateway_ip`, `sandbox_ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.podman]`.
 
-On macOS with `podman machine`, the driver uses gvproxy's host-loopback IP, `192.168.127.254`, for sandbox host aliases by default. Set `host_gateway_ip` only when your Podman machine uses a non-standard host-loopback address. On Linux, an empty `host_gateway_ip` keeps Podman's `host-gateway` resolver behavior.
+Podman sandboxes default to a 45-second graceful stop window before Podman escalates from `SIGTERM` to `SIGKILL`. Set `stop_timeout_secs` in gateway config, or `OPENSHELL_STOP_TIMEOUT` for the standalone driver, when a local runtime needs a different teardown window.
+
+For proxy-required networks, the Podman driver also accepts the corporate egress proxy keys `https_proxy`, `no_proxy`, `proxy_auth_file`, `proxy_auth_allow_insecure`, and `proxy_connect_by_hostname`. The supervisor chains policy-approved TLS tunnels through the proxy with HTTP CONNECT instead of dialing destinations directly. See the [Gateway Configuration File](./gateway-config) reference for the full contract, including the cleartext-credential acknowledgement and the validated-IP CONNECT behavior.
+
+On macOS with `podman machine`, the driver uses gvproxy's host-loopback IP, `192.168.127.254`, for sandbox host aliases by default. Set `host_gateway_ip` only when your Podman machine uses a non-standard host-loopback address. On Linux, an empty `host_gateway_ip` keeps Podman's `host-gateway` resolver behavior. Direct local callbacks from rootless Podman require Podman to report the pasta network helper. Slirp4netns, other helpers, and Podman versions that do not report their helper require an explicitly remote `grpc_endpoint`; otherwise the gateway fails startup rather than leaving sandbox callbacks unreachable. Rootful Podman continues to use the configured network's bridge gateway address.
 
 ### Podman Driver Config Mounts
 
@@ -227,16 +242,17 @@ Podman mount schema:
 
 | Type | Fields |
 |---|---|
-| `bind` | `source`, `target`, optional `read_only` (`true` by default). `source` must be an absolute host path. Requires `enable_bind_mounts = true`. |
+| `bind` | `source`, `target`, optional `read_only` (`true` by default), optional `selinux_label` (`shared` for `:z` or `private` for `:Z`). `source` must be an absolute host path. Requires `enable_bind_mounts = true`. |
 | `volume` | `source`, `target`, optional `read_only` (`true` by default). The named volume must already exist. Podman local-driver bind-backed volumes require `enable_bind_mounts = true`. |
 | `tmpfs` | `target`, optional `options`, optional `size_bytes`, optional `mode`. |
 | `image` | `source`, `target`, optional `read_only` (`true` by default). |
 
 Podman `volume` and `image` mounts do not support `subpath` in OpenShell driver
-config. OpenShell rejects mount targets that replace the workspace root,
-container root, supervisor files, `/etc/openshell`, `/etc/openshell-tls`,
-authentication material, or network namespace paths. These checks do not make
-host bind mounts safe.
+config, and OpenShell rejects `subpath` for those mount types. OpenShell rejects
+mount `source` and `target` values with surrounding whitespace. OpenShell also
+rejects mount targets that replace the workspace root, container root, supervisor
+files, `/etc/openshell`, `/etc/openshell-tls`, authentication material, or
+network namespace paths. These checks do not make host bind mounts safe.
 
 ## MicroVM Driver
 
@@ -301,15 +317,162 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `image_pull_secrets` | `server.sandboxImagePullSecrets` | Attach Kubernetes image pull secrets to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
 | `grpc_endpoint` | `server.grpcEndpoint` | Set the gateway callback endpoint reachable from sandbox pods. |
 | `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Mount sandbox client TLS materials from a Kubernetes secret. |
-| `supervisor_image` | `supervisor.image.repository` / `supervisor.image.tag` | Set the supervisor image that provides the `openshell-sandbox` binary. |
+| `supervisor_image` | `supervisor.image.repository` / `supervisor.image.tag` | Override the supervisor image that provides the `openshell-sandbox` binary. The default repository with an empty tag uses the version-pinned image built into the gateway. Changing the repository uses the effective gateway image tag, while setting a tag pins that version explicitly. |
 | `supervisor_image_pull_policy` | `supervisor.image.pullPolicy` | Set the Kubernetes image pull policy for the supervisor image. |
 | `supervisor_sideload_method` | `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect from cluster version. Set to `image-volume` to mount the supervisor OCI image directly as a volume (requires Kubernetes 1.33+ with the ImageVolume feature gate; GA in 1.36), or `init-container` to copy it through an init container on older clusters. |
+| `topology` | `supervisor.topology` | Set `combined` for the default single supervisor path, or `sidecar` to move pod-level network enforcement and the gateway session into a dedicated sidecar. |
+| `sidecar.proxy_uid` | `supervisor.sidecar.proxyUid` | Non-root UID used by the relaxed sidecar when process/binary-aware network policy is disabled. The default binary-aware sidecar runs as UID 0. The network init container exempts the effective sidecar UID from proxy redirection. |
+| `sidecar.process_binary_aware_network_policy` | `supervisor.sidecar.processBinaryAwareNetworkPolicy` | Keep process/binary-aware network policy enabled in `sidecar` topology. The default runs the sidecar as UID 0 with `SYS_PTRACE` and `DAC_READ_SEARCH`. Set false to run as `proxy_uid`, drop both capabilities, and enforce endpoint/L7 policy without matching `policy.binaries`. |
 | `app_armor_profile` | `server.appArmorProfile` | Set the sandbox agent container's AppArmor profile. Helm defaults this to `Unconfined` so AppArmor-enabled nodes do not block supervisor network namespace setup. Set the Helm value to an empty string to omit the field, or use `RuntimeDefault` or `Localhost/<profile-name>` for operator-managed profiles. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
+| `workspace_storage_class` | `server.workspaceStorageClass` | Set the `StorageClass` for the workspace PVC. Empty (default) omits `storageClassName` and uses the cluster's default `StorageClass`. Set this on clusters with no default `StorageClass`, otherwise the workspace PVC stays `Pending` and the sandbox never starts. |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
 
-The Kubernetes driver creates namespaced `agents.x-k8s.io/v1alpha1` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
+In `combined` topology, the agent container carries the Linux capabilities
+needed by the supervisor for network namespace setup, Landlock filesystem
+policy, process privilege changes, and network policy enforcement. In `sidecar`
+topology, the agent container runs as the resolved sandbox UID/GID with no added
+Linux capabilities. A root init container performs the nftables setup, and the
+long-running binary-aware sidecar runs as UID 0, drops default capabilities,
+and adds `SYS_PTRACE` plus `DAC_READ_SEARCH` for workload process identity
+resolution through shared `/proc`. The
+`sidecar.process_binary_aware_network_policy = false` setting runs it as the
+configured non-root `proxy_uid`, removes both capabilities, and relaxes network
+policy to endpoint/L7 matching only. The
+network sidecar owns gateway authentication and writes local policy/provider
+state to the process supervisor over a local control socket, so the agent
+container does not mount the sandbox bootstrap token or client TLS secret in
+the default sidecar path. The provider environment is refreshed by the network
+sidecar after settings polls and streamed to the process supervisor so future
+child processes can see updated provider env without gateway access in the
+agent container.
+Sidecar mode keeps gateway session and SSH behavior. The process supervisor
+applies Landlock filesystem policy and child seccomp filters where supported,
+but it does not perform root-to-sandbox privilege dropping or supervisor
+identity mount isolation. Network policy still runs in the sidecar, and sidecar
+pods set `shareProcessNamespace: true` so the network sidecar can resolve
+process/binary identity through `/proc/<entrypoint-pid>`.
+
+The Kubernetes driver creates namespaced `agents.x-k8s.io` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. It detects the served Sandbox API at runtime, caches the selected API version for the gateway process, and uses `v1beta1` when available before falling back to `v1alpha1`, so supported Agent Sandbox installations work without version-specific operator configuration. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
+
+If Agent Sandbox is upgraded in place, restart the OpenShell gateway after the controller and CRD rollout completes so the gateway can detect the served API versions again.
 
 <Note>
 `Sandbox.spec.volumeClaimTemplates` is immutable after creation. To change storage configuration, delete the sandbox and create a new one with the updated spec.
 </Note>
+
+### Kubernetes Driver Config PVC Mounts
+
+Kubernetes driver config can mount existing PersistentVolumeClaims into the
+agent container. Use this when storage is provisioned outside OpenShell and a
+sandbox should mount selected PVC subpaths instead of using the default
+OpenShell-created `/sandbox` workspace PVC.
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{
+    "kubernetes": {
+      "volumes": [{
+        "name": "user-data",
+        "persistent_volume_claim": {
+          "claim_name": "pvc-user-data-123",
+          "read_only": false
+        }
+      }],
+      "containers": {
+        "agent": {
+          "volume_mounts": [
+            {
+              "name": "user-data",
+              "mount_path": "/sandbox/.openshell/workspace",
+              "sub_path": "workspace",
+              "read_only": false
+            },
+            {
+              "name": "user-data",
+              "mount_path": "/sandbox/.openshell/memory",
+              "sub_path": "memory",
+              "read_only": false
+            }
+          ]
+        }
+      }
+    }
+  }' \
+  -- claude
+```
+
+Kubernetes PVC mount schema:
+
+| Field | Description |
+|---|---|
+| `volumes[].name` | Pod volume name. It must be a DNS-1123 label, unique, and not use OpenShell-managed volume names. |
+| `volumes[].persistent_volume_claim.claim_name` | Existing PVC name in the sandbox namespace. It must be a DNS-1123 subdomain name. |
+| `volumes[].persistent_volume_claim.read_only` | Optional. Defaults to `true`. Set `false` to allow read-write mounts. |
+| `containers.agent.volume_mounts[].name` | References a volume declared in `volumes`. |
+| `containers.agent.volume_mounts[].mount_path` | Absolute, normalized container path for the agent mount. |
+| `containers.agent.volume_mounts[].sub_path` | Optional relative PVC subpath. Absolute paths and `..` are rejected. |
+| `containers.agent.volume_mounts[].read_only` | Optional. Defaults to `true`. It cannot be `false` when the PVC volume is read-only. |
+
+OpenShell rejects duplicate volume names, mounts that reference unknown volumes,
+protected mount targets, and mounts that replace OpenShell TLS, supervisor,
+ServiceAccount token, or SPIFFE paths. Read-write PVC access requires
+`read_only: false` on both the PVC volume and each writable mount.
+
+Any driver-config mount under `/sandbox` disables the default `/sandbox`
+workspace PVC injection for that sandbox. Only the explicit mount paths persist
+through the external PVC; other `/sandbox` paths come from the current sandbox
+image.
+
+## Sandbox User Identity
+
+The policy can set `process.run_as_user` and `process.run_as_group`
+independently. Each explicit field wins. The active compute driver supplies the
+identity for omitted fields.
+
+### Docker / Podman
+
+Docker and Podman inspect the final image and use its OCI `USER` declaration as
+a per-field fallback. Supported forms include `app`, `app:staff`, a numeric UID
+whose passwd entry supplies its primary GID, and an accountless numeric pair
+such as `1234:1235`.
+
+The driver pins container creation to the immutable image ID it inspected. The
+supervisor validates any required names inside that image and preserves the
+declared name or numeric components for both direct and SSH children. When
+`USER` omits the group, the supervisor uses the user's numeric primary GID. It
+does not modify `/etc/passwd` or `/etc/group`.
+
+Sandbox creation fails before readiness if a required `USER` component is
+missing, malformed, unknown, ambiguous, or resolves to UID/GID 0. An image
+without `USER` therefore works only when policy explicitly provides both
+identity fields.
+
+### Kubernetes / OpenShift
+
+The Kubernetes driver auto-detects the sandbox UID from OpenShift SCC namespace annotations:
+
+- `openshift.io/sa.scc.uid-range` (format: `<start>/<size>`, e.g. `1000000000/10000`) provides the UID.
+- `openshift.io/sa.scc.supplemental-groups` provides the GID when present; otherwise the resolved UID is used as the GID.
+- On non-OpenShift clusters, or when annotations are absent, the driver falls back to `1000`.
+
+You can override autodetection with explicit `sandbox_uid` / `sandbox_gid` config in `[openshell.drivers.kubernetes]`. When set, the driver skips namespace annotation lookup entirely.
+
+The resolved UID/GID appear in:
+
+- Supervisor container environment variables (`OPENSHELL_SANDBOX_UID`, `OPENSHELL_SANDBOX_GID`) for direct kernel-level privilege dropping without `/etc/passwd` lookups.
+- PVC init container `securityContext.runAsUser/runAsGroup/fsGroup` for workspace ownership operations.
+
+### VM Driver
+
+The VM driver injects the sandbox UID into the rootfs guest's `/etc/passwd`, `/etc/group`, and `/etc/gshadow` during rootfs preparation. Default UID is `10001`; configure `sandbox_uid` in `[openshell.drivers.vm]` to use a different value.
+
+### Custom Images
+
+Docker and Podman custom images do not need a baked-in `"sandbox"` user. Declare
+a non-root OCI `USER`, or set both process identity fields explicitly in policy.
+Named image users require matching account entries; a numeric `UID:GID` pair
+does not. OpenShell continues to use `/sandbox` as the workspace; it does not
+adopt the image's OCI working directory. Until OCI working-directory support is
+added, custom images must create `/sandbox` and make it writable by the selected
+identity.

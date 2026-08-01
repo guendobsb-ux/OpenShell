@@ -25,7 +25,11 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use openshell_core::config::ComputeDriverKind;
-use openshell_core::{GatewayAuthConfig, GatewayJwtConfig, MtlsAuthConfig, OidcConfig, TlsConfig};
+use openshell_core::proto::SupervisorMiddlewareService;
+use openshell_core::{
+    GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
+    GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig, TlsConfig,
+};
 use serde::{Deserialize, Serialize};
 
 /// Latest schema version this build understands.
@@ -54,6 +58,9 @@ pub struct OpenShellRoot {
 
     #[serde(default)]
     pub gateway: GatewayFileSection,
+
+    #[serde(default)]
+    pub supervisor: SupervisorFileSection,
 
     /// `[openshell.drivers.<name>]` tables — passed verbatim to each driver
     /// crate's `Deserialize` impl after the gateway-side inheritance merge.
@@ -98,6 +105,9 @@ pub struct GatewayFileSection {
     pub grpc_rate_limit_requests: Option<u64>,
     #[serde(default)]
     pub grpc_rate_limit_window_seconds: Option<u64>,
+    /// Security posture when a sandbox rejects a candidate policy generation.
+    #[serde(default)]
+    pub policy_validation_failure_mode: Option<openshell_core::PolicyValidationFailureMode>,
 
     // ── Service routing ──────────────────────────────────────────────────
     /// Subject Alternative Names configured on the gateway server certificate.
@@ -147,9 +157,15 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub auth: Option<GatewayAuthConfig>,
     #[serde(default)]
+    pub interceptors: Vec<GatewayInterceptorConfig>,
+    #[serde(default)]
+    pub provider_profile_sources: Option<Vec<GatewayProviderProfileSourceConfig>>,
+    #[serde(default)]
     pub mtls_auth: Option<MtlsAuthConfig>,
     #[serde(default)]
     pub gateway_jwt: Option<GatewayJwtConfig>,
+    #[serde(default)]
+    pub otlp: Option<OtlpConfig>,
 
     // ── Disallowed-in-file fields ────────────────────────────────────────
     //
@@ -158,6 +174,59 @@ pub struct GatewayFileSection {
     // rejected in [`load`].
     #[serde(default)]
     pub database_url: Option<String>,
+}
+
+/// `[openshell.gateway.otlp]` section.
+///
+/// Presence of this table enables OTLP export; there is no `enabled` flag.
+/// SDK tuning knobs are deliberately absent — see [`crate::otel_tracing`] for what
+/// this table owns and what the `OTEL_*` environment variables own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OtlpConfig {
+    /// OTLP/gRPC collector endpoint, e.g.
+    /// `http://otel-collector.observability.svc:4317`.
+    pub endpoint: String,
+
+    /// `service.name` resource attribute. Defaults to `openshell-gateway`.
+    #[serde(default)]
+    pub service_name: Option<String>,
+}
+
+/// `[openshell.supervisor]` section.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorFileSection {
+    /// Statically registered supervisor middleware services. Registration is
+    /// operator-owned and changes require a gateway restart.
+    #[serde(default)]
+    pub middleware: Vec<MiddlewareServiceFileConfig>,
+}
+
+/// One `[[openshell.supervisor.middleware]]` supervisor middleware registration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MiddlewareServiceFileConfig {
+    /// Operator-facing name used for diagnostics.
+    pub name: String,
+    /// Plaintext gRPC endpoint reachable by the gateway and supervisors.
+    pub grpc_endpoint: String,
+    /// Operator-owned body limit for every binding exposed by this service.
+    pub max_body_bytes: u64,
+    /// Default RPC timeout using an integer with an `ms` or `s` suffix.
+    #[serde(default)]
+    pub timeout: Option<String>,
+}
+
+impl From<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
+    fn from(config: &MiddlewareServiceFileConfig) -> Self {
+        Self {
+            name: config.name.clone(),
+            grpc_endpoint: config.grpc_endpoint.clone(),
+            max_body_bytes: config.max_body_bytes,
+            timeout: config.timeout.clone().unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -231,7 +300,7 @@ pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
 /// the gateway section, which keeps each driver's `deny_unknown_fields`
 /// invariant intact.
 pub fn driver_table(
-    driver: ComputeDriverKind,
+    driver_name: &str,
     gateway: &GatewayFileSection,
     raw: Option<&toml::Value>,
 ) -> toml::Value {
@@ -240,7 +309,7 @@ pub fn driver_table(
         _ => toml::Table::new(),
     };
 
-    for key in inheritable_keys(driver) {
+    for key in inheritable_keys(driver_name) {
         if merged.contains_key(*key) {
             continue;
         }
@@ -255,9 +324,9 @@ pub fn driver_table(
 /// Inheritance allowlist (the Q4 "high-overlap set"). Each driver opts in
 /// to a specific subset so a gateway-wide default does not accidentally land
 /// in a driver table that does not understand the field.
-fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
-    match driver {
-        ComputeDriverKind::Kubernetes => &[
+fn inheritable_keys(driver_name: &str) -> &'static [&'static str] {
+    match driver_name.parse::<ComputeDriverKind>().ok() {
+        Some(ComputeDriverKind::Kubernetes) => &[
             "namespace",
             "default_image",
             "supervisor_image",
@@ -267,7 +336,7 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
             "enable_user_namespaces",
             "sa_token_ttl_secs",
         ],
-        ComputeDriverKind::Docker => &[
+        Some(ComputeDriverKind::Docker) => &[
             "sandbox_namespace",
             "default_image",
             "supervisor_image",
@@ -276,7 +345,7 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
             "guest_tls_cert",
             "guest_tls_key",
         ],
-        ComputeDriverKind::Podman => &[
+        Some(ComputeDriverKind::Podman) => &[
             "default_image",
             "supervisor_image",
             "host_gateway_ip",
@@ -284,12 +353,13 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
             "guest_tls_cert",
             "guest_tls_key",
         ],
-        ComputeDriverKind::Vm => &[
+        Some(ComputeDriverKind::Vm) => &[
             "default_image",
             "guest_tls_ca",
             "guest_tls_cert",
             "guest_tls_key",
         ],
+        None => &[],
     }
 }
 
@@ -355,6 +425,7 @@ compute_drivers = ["kubernetes"]
 sandbox_namespace = "agents"
 grpc_rate_limit_requests = 120
 grpc_rate_limit_window_seconds = 60
+policy_validation_failure_mode = "retain_last_valid"
 default_image = "ghcr.io/nvidia/openshell/sandbox:latest"
 supervisor_image = "ghcr.io/nvidia/openshell/supervisor:latest"
 client_tls_secret_name = "openshell-sandbox-tls"
@@ -383,9 +454,83 @@ grpc_endpoint = "https://openshell-gateway.agents.svc:8080"
         );
         assert_eq!(gw.grpc_rate_limit_requests, Some(120));
         assert_eq!(gw.grpc_rate_limit_window_seconds, Some(60));
+        assert_eq!(
+            gw.policy_validation_failure_mode,
+            Some(openshell_core::PolicyValidationFailureMode::RetainLastValid)
+        );
         assert!(gw.tls.is_some());
         assert!(gw.oidc.is_some());
         assert!(file.openshell.drivers.contains_key("kubernetes"));
+    }
+
+    #[test]
+    fn parses_gateway_otlp_config() {
+        let toml = r#"
+[openshell.gateway.otlp]
+endpoint = "http://otel-collector.observability.svc:4317"
+service_name = "openshell-gateway-dev"
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid otlp config parses");
+        let otlp = file.openshell.gateway.otlp.expect("otlp config");
+        assert_eq!(
+            otlp.endpoint,
+            "http://otel-collector.observability.svc:4317"
+        );
+        assert_eq!(otlp.service_name.as_deref(), Some("openshell-gateway-dev"));
+    }
+
+    #[test]
+    fn otlp_config_requires_only_endpoint() {
+        let toml = r#"
+[openshell.gateway.otlp]
+endpoint = "http://127.0.0.1:4317"
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("minimal otlp config parses");
+        let otlp = file.openshell.gateway.otlp.expect("otlp config");
+        assert_eq!(otlp.endpoint, "http://127.0.0.1:4317");
+        assert!(otlp.service_name.is_none());
+    }
+
+    #[test]
+    fn otlp_config_rejects_unknown_fields() {
+        let toml = r#"
+[openshell.gateway.otlp]
+endpoint = "http://127.0.0.1:4317"
+protocol = "http"
+"#;
+        let tmp = write_tmp(toml);
+        assert!(load(tmp.path()).is_err(), "unknown otlp field is rejected");
+    }
+
+    #[test]
+    fn otlp_config_rejects_sdk_tuning_keys() {
+        // Sampling, batching, and limits are the SDK's env-var surface. A
+        // `deny_unknown_fields` rejection is the signal that they do not
+        // belong in the config file.
+        let toml = r#"
+[openshell.gateway.otlp]
+endpoint = "http://127.0.0.1:4317"
+sampler = "traceidratio"
+"#;
+        let tmp = write_tmp(toml);
+        assert!(
+            load(tmp.path()).is_err(),
+            "sampler is configured via OTEL_TRACES_SAMPLER, not TOML"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_policy_validation_failure_mode() {
+        let tmp = write_tmp(
+            r#"
+[openshell.gateway]
+policy_validation_failure_mode = "keep_old"
+"#,
+        );
+        let error = load(tmp.path()).expect_err("unknown posture must fail TOML validation");
+        assert!(error.to_string().contains("policy_validation_failure_mode"));
     }
 
     #[test]
@@ -398,6 +543,55 @@ allow_unauthenticated_users = true
         let file = load(tmp.path()).expect("valid auth config parses");
         let auth = file.openshell.gateway.auth.expect("auth config");
         assert!(auth.allow_unauthenticated_users);
+    }
+
+    #[test]
+    fn parses_supervisor_middleware_registration() {
+        let toml = r#"
+[[openshell.supervisor.middleware]]
+name = "local-guard"
+grpc_endpoint = "http://127.0.0.1:50051"
+max_body_bytes = 262144
+timeout = "2s"
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid middleware registration parses");
+        assert_eq!(
+            file.openshell.supervisor.middleware,
+            vec![MiddlewareServiceFileConfig {
+                name: "local-guard".into(),
+                grpc_endpoint: "http://127.0.0.1:50051".into(),
+                max_body_bytes: 262_144,
+                timeout: Some("2s".into()),
+            }]
+        );
+        let registration =
+            SupervisorMiddlewareService::from(&file.openshell.supervisor.middleware[0]);
+        assert_eq!(registration.timeout, "2s");
+    }
+
+    #[test]
+    fn parses_provider_profile_source_composition() {
+        let toml = r#"
+[openshell.gateway]
+provider_profile_sources = [
+  { type = "builtin" },
+  { type = "user" },
+  { type = "interceptor", name = "provider-governance" },
+]
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid provider profile sources parse");
+        assert_eq!(
+            file.openshell.gateway.provider_profile_sources,
+            Some(vec![
+                GatewayProviderProfileSourceConfig::Builtin,
+                GatewayProviderProfileSourceConfig::User,
+                GatewayProviderProfileSourceConfig::Interceptor {
+                    name: "provider-governance".to_string(),
+                },
+            ])
+        );
     }
 
     #[test]
@@ -484,7 +678,7 @@ version = 2
             namespace = "agents"
         };
         let merged = driver_table(
-            ComputeDriverKind::Kubernetes,
+            ComputeDriverKind::Kubernetes.as_str(),
             &gateway,
             Some(&toml::Value::Table(raw)),
         );
@@ -511,7 +705,7 @@ version = 2
             host_gateway_ip: Some("10.0.0.1".to_string()),
             ..Default::default()
         };
-        let merged = driver_table(ComputeDriverKind::Docker, &gateway, None);
+        let merged = driver_table(ComputeDriverKind::Docker.as_str(), &gateway, None);
         let table = merged.as_table().expect("table");
         assert_eq!(
             table.get("sandbox_namespace").and_then(|v| v.as_str()),
@@ -534,7 +728,7 @@ version = 2
             host_gateway_ip: Some("192.168.127.254".to_string()),
             ..Default::default()
         };
-        let merged = driver_table(ComputeDriverKind::Podman, &gateway, None);
+        let merged = driver_table(ComputeDriverKind::Podman.as_str(), &gateway, None);
         let table = merged.as_table().expect("table");
         assert_eq!(
             table.get("default_image").and_then(|v| v.as_str()),
@@ -556,7 +750,7 @@ version = 2
             default_image = "driver-specific"
         };
         let merged = driver_table(
-            ComputeDriverKind::Podman,
+            ComputeDriverKind::Podman.as_str(),
             &gateway,
             Some(&toml::Value::Table(raw)),
         );
@@ -578,13 +772,35 @@ version = 2
             client_tls_secret_name: Some("openshell-sandbox-tls".to_string()),
             ..Default::default()
         };
-        let merged = driver_table(ComputeDriverKind::Docker, &gateway, None);
+        let merged = driver_table(ComputeDriverKind::Docker.as_str(), &gateway, None);
         assert!(
             !merged
                 .as_table()
                 .unwrap()
                 .contains_key("client_tls_secret_name")
         );
+    }
+
+    #[test]
+    fn remote_driver_table_does_not_inherit_gateway_defaults() {
+        let gateway = GatewayFileSection {
+            default_image: Some("gateway-default:1.0".to_string()),
+            host_gateway_ip: Some("10.0.0.1".to_string()),
+            ..Default::default()
+        };
+        let raw = toml::toml! {
+            socket_path = "/run/openshell/kyma.sock"
+        };
+
+        let merged = driver_table("kyma", &gateway, Some(&toml::Value::Table(raw)));
+        let table = merged.as_table().expect("table");
+
+        assert_eq!(
+            table.get("socket_path").and_then(|v| v.as_str()),
+            Some("/run/openshell/kyma.sock")
+        );
+        assert!(!table.contains_key("default_image"));
+        assert!(!table.contains_key("host_gateway_ip"));
     }
 
     #[test]
@@ -601,7 +817,8 @@ version = 2
     /// `load()` path that the gateway uses at runtime, catching:
     ///   - template corruption or unknown fields (`deny_unknown_fields`)
     ///   - schema drift (version bump or field renames)
-    ///   - accidental changes to the bind address or compute driver list
+    ///   - accidental addition of a wildcard bind-address override
+    ///   - accidental changes to the compute driver list
     #[test]
     fn rpm_default_config_parses_and_has_podman_defaults() {
         let path =
@@ -610,20 +827,12 @@ version = 2
             load(&path).expect("deploy/rpm/gateway.toml.default must parse against current schema");
         let gw = &config.openshell.gateway;
 
-        let addr = gw
-            .bind_address
-            .expect("bind_address must be explicitly set in the RPM default config");
-        assert!(
-            addr.ip().is_unspecified(),
-            "RPM default bind_address must be 0.0.0.0 so Podman sandbox containers \
-             can reach the gateway over the host network bridge, got {addr}"
-        );
-        assert_eq!(
-            addr.port(),
-            openshell_core::config::DEFAULT_SERVER_PORT,
-            "RPM default port must match DEFAULT_SERVER_PORT ({})",
-            openshell_core::config::DEFAULT_SERVER_PORT
-        );
+        if let Some(addr) = gw.bind_address {
+            assert!(
+                !addr.ip().is_unspecified(),
+                "RPM default config must not expose the primary listener on every interface"
+            );
+        }
 
         let drivers = gw
             .compute_drivers

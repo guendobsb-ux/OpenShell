@@ -11,7 +11,7 @@
 
 use miette::{IntoDiagnostic, Result};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::time::timeout;
 use tracing::info;
@@ -24,6 +24,7 @@ use openshell_ocsf::{
 #[cfg(target_os = "linux")]
 use crate::netns::NetworkNamespace;
 use openshell_core::policy::{NetworkMode, SandboxPolicy};
+use openshell_core::proposals::AgentProposals;
 use openshell_core::provider_credentials::ProviderCredentialState;
 
 #[cfg(target_os = "linux")]
@@ -33,7 +34,9 @@ use openshell_core::denial::DenialEvent;
 
 #[cfg(target_os = "linux")]
 use crate::managed_children;
-use crate::process::ProcessHandle;
+use crate::process::{
+    ProcessEnforcementMode, ProcessHandle, ProcessStatus, ResolvedProcessIdentity,
+};
 
 fn ocsf_ctx() -> &'static openshell_ocsf::SandboxContext {
     openshell_ocsf::ctx::ctx()
@@ -56,34 +59,50 @@ pub async fn run_process(
     sandbox_id: Option<&str>,
     openshell_endpoint: Option<&str>,
     ssh_socket_path: Option<String>,
+    shared_ssh_socket: bool,
     policy: &SandboxPolicy,
+    resolved_process_identity: ResolvedProcessIdentity,
+    enforcement_mode: ProcessEnforcementMode,
     entrypoint_pid: Arc<AtomicU32>,
+    entrypoint_started_tx: Option<tokio::sync::oneshot::Sender<u32>>,
     provider_credentials: ProviderCredentialState,
     provider_env: std::collections::HashMap<String, String>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    agent_proposals: AgentProposals,
     #[cfg(target_os = "linux")] netns: Option<&NetworkNamespace>,
     #[cfg(target_os = "linux")] bypass_denial_tx: Option<
         tokio::sync::mpsc::UnboundedSender<DenialEvent>,
     >,
     #[cfg(target_os = "linux")] bypass_activity_tx: Option<ActivitySender>,
 ) -> Result<i32> {
-    // Validate that the sandbox user exists in the image. All sandbox images
-    // must include a "sandbox" user for privilege dropping; failing fast here
-    // beats silently running children as root.
+    // Platform drivers with a resolved numeric UID/GID retain the legacy
+    // account-file update. OCI-image identity leaves those environment values
+    // empty, so the image's account files remain unchanged.
     #[cfg(unix)]
-    crate::process::validate_sandbox_user(policy)?;
+    if enforcement_mode.uses_privileged_process_setup() {
+        crate::process::update_sandbox_passwd_entries()?;
+    }
+
+    // Validate the completed process identity before exposing a child.
+    #[cfg(unix)]
+    if enforcement_mode.uses_privileged_process_setup() {
+        crate::process::validate_sandbox_user_with_identity(policy, resolved_process_identity)?;
+        crate::process::validate_sandbox_group_with_identity(policy, resolved_process_identity)?;
+    }
 
     // Create read_write directories and chown newly-created ones to the
     // sandbox user/group. Runs as the supervisor (root) before the child
     // is forked so the workload sees writable paths it owns.
     #[cfg(unix)]
-    crate::process::prepare_filesystem(policy)?;
+    if enforcement_mode.uses_privileged_process_setup() {
+        crate::process::prepare_filesystem_with_identity(policy, resolved_process_identity)?;
+    }
 
     // Eagerly fetch initial settings and install the agent skill if the
     // proposals flag is on at startup, rather than waiting for the policy
     // poll loop's first tick. In offline/file-mode there is no gateway, so
     // the flag stays at its default (false) and no skill is installed.
-    install_initial_agent_skill(sandbox_id, openshell_endpoint).await;
+    install_initial_agent_skill(sandbox_id, openshell_endpoint, &agent_proposals).await;
 
     // Install the supervisor seccomp prelude before spawning any workload-side
     // tasks. By this point the orchestrator has finished privileged startup
@@ -198,31 +217,10 @@ pub async fn run_process(
     // their env so cooperative tools (curl, npm, Node) route through the
     // CONNECT proxy. Linux uses the netns host_ip; on other targets fall back
     // to the policy-declared http_addr directly.
-    let ssh_proxy_url = if matches!(policy.network.mode, NetworkMode::Proxy) {
-        #[cfg(target_os = "linux")]
-        {
-            netns.map(|ns| {
-                let port = policy
-                    .network
-                    .proxy
-                    .as_ref()
-                    .and_then(|p| p.http_addr)
-                    .map_or(3128, |addr| addr.port());
-                format!("http://{}:{port}", ns.host_ip())
-            })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            policy
-                .network
-                .proxy
-                .as_ref()
-                .and_then(|p| p.http_addr)
-                .map(|addr| format!("http://{addr}"))
-        }
-    } else {
-        None
-    };
+    #[cfg(target_os = "linux")]
+    let ssh_proxy_url = ssh_proxy_url_for_policy(policy, netns.map(NetworkNamespace::host_ip));
+    #[cfg(not(target_os = "linux"))]
+    let ssh_proxy_url = ssh_proxy_url_for_policy(policy, None);
 
     let ssh_socket_path: Option<std::path::PathBuf> = ssh_socket_path.map(std::path::PathBuf::from);
     if let Some(listen_path) = ssh_socket_path.clone() {
@@ -251,6 +249,9 @@ pub async fn run_process(
                 ca_paths,
                 provider_credentials_clone,
                 user_env_clone,
+                resolved_process_identity,
+                enforcement_mode,
+                shared_ssh_socket,
             )
             .await
             {
@@ -295,6 +296,8 @@ pub async fn run_process(
         }
     }
 
+    let supervisor_terminating = Arc::new(AtomicBool::new(false));
+
     // Spawn the persistent supervisor session if we have a gateway endpoint
     // and sandbox identity. The session provides relay channels for SSH
     // connect and ExecSandbox through the gateway.
@@ -306,6 +309,8 @@ pub async fn run_process(
             id.to_string(),
             socket.clone(),
             ssh_netns_fd,
+            None,
+            Arc::clone(&supervisor_terminating),
         );
         info!("supervisor session task spawned");
     }
@@ -317,6 +322,8 @@ pub async fn run_process(
         workdir,
         interactive,
         policy,
+        resolved_process_identity,
+        enforcement_mode,
         netns,
         ca_file_paths.as_ref(),
         &provider_env,
@@ -329,12 +336,17 @@ pub async fn run_process(
         workdir,
         interactive,
         policy,
+        resolved_process_identity,
+        enforcement_mode,
         ca_file_paths.as_ref(),
         &provider_env,
     )?;
 
     // Store the entrypoint PID so the proxy can resolve TCP peer identity
     entrypoint_pid.store(handle.pid(), Ordering::Release);
+    if let Some(tx) = entrypoint_started_tx {
+        let _ = tx.send(handle.pid());
+    }
     ocsf_emit!(
         ProcessActivityBuilder::new(ocsf_ctx())
             .activity(ActivityId::Open)
@@ -348,11 +360,13 @@ pub async fn run_process(
             .build()
     );
 
-    // Wait for process with optional timeout
-    let result = if timeout_secs > 0 {
-        if let Ok(result) = timeout(Duration::from_secs(timeout_secs), handle.wait()).await {
-            result
-        } else {
+    let outcome =
+        wait_for_process_exit_or_shutdown(&mut handle, timeout_secs, &supervisor_terminating)
+            .await?;
+
+    let status = match outcome {
+        ProcessWaitOutcome::Exited(status) => status,
+        ProcessWaitOutcome::TimedOut => {
             ocsf_emit!(
                 ProcessActivityBuilder::new(ocsf_ctx())
                     .activity(ActivityId::Close)
@@ -363,14 +377,18 @@ pub async fn run_process(
                     .message("Process timed out, killing")
                     .build()
             );
-            handle.kill()?;
             return Ok(124); // Standard timeout exit code
         }
-    } else {
-        handle.wait().await
+        ProcessWaitOutcome::ShutdownSignal { signal, status } => {
+            info!(
+                signal,
+                exit_code = status.code(),
+                "Entrypoint exited after supervisor shutdown signal"
+            );
+            status
+        }
     };
-
-    let status = result.into_diagnostic()?;
+    supervisor_terminating.store(true, Ordering::Release);
 
     ocsf_emit!(
         ProcessActivityBuilder::new(ocsf_ctx())
@@ -387,6 +405,134 @@ pub async fn run_process(
     Ok(status.code())
 }
 
+enum ProcessWaitOutcome {
+    Exited(ProcessStatus),
+    TimedOut,
+    ShutdownSignal {
+        signal: &'static str,
+        status: ProcessStatus,
+    },
+}
+
+async fn wait_for_process_exit_or_shutdown(
+    handle: &mut ProcessHandle,
+    timeout_secs: u64,
+    terminating: &AtomicBool,
+) -> Result<ProcessWaitOutcome> {
+    let pid = handle.pid();
+    let wait = handle.wait();
+    tokio::pin!(wait);
+
+    if timeout_secs > 0 {
+        let deadline = tokio::time::sleep(Duration::from_secs(timeout_secs));
+        tokio::pin!(deadline);
+        tokio::select! {
+            result = &mut wait => {
+                terminating.store(true, Ordering::Release);
+                Ok(ProcessWaitOutcome::Exited(result.into_diagnostic()?))
+            }
+            () = &mut deadline => {
+                terminating.store(true, Ordering::Release);
+                terminate_then_kill_pid(pid).await;
+                Ok(ProcessWaitOutcome::TimedOut)
+            }
+            signal = wait_for_supervisor_shutdown_signal() => {
+                terminating.store(true, Ordering::Release);
+                signal_entrypoint_for_shutdown(pid, signal);
+                let status = (&mut wait).await.into_diagnostic()?;
+                Ok(ProcessWaitOutcome::ShutdownSignal { signal, status })
+            }
+        }
+    } else {
+        tokio::select! {
+            result = &mut wait => {
+                terminating.store(true, Ordering::Release);
+                Ok(ProcessWaitOutcome::Exited(result.into_diagnostic()?))
+            }
+            signal = wait_for_supervisor_shutdown_signal() => {
+                terminating.store(true, Ordering::Release);
+                signal_entrypoint_for_shutdown(pid, signal);
+                let status = (&mut wait).await.into_diagnostic()?;
+                Ok(ProcessWaitOutcome::ShutdownSignal { signal, status })
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_then_kill_pid(pid: u32) {
+    signal_pid(pid, nix::sys::signal::Signal::SIGTERM, "process timeout");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    signal_pid(pid, nix::sys::signal::Signal::SIGKILL, "process timeout");
+}
+
+#[cfg(not(unix))]
+async fn terminate_then_kill_pid(_pid: u32) {}
+
+#[cfg(unix)]
+fn signal_entrypoint_for_shutdown(pid: u32, signal: &'static str) {
+    signal_pid(pid, nix::sys::signal::Signal::SIGTERM, signal);
+}
+
+#[cfg(not(unix))]
+fn signal_entrypoint_for_shutdown(_pid: u32, _signal: &'static str) {}
+
+#[cfg(unix)]
+fn signal_pid(pid: u32, signal: nix::sys::signal::Signal, reason: &'static str) {
+    let raw_pid = i32::try_from(pid).unwrap_or(i32::MAX);
+    if let Err(error) = nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw_pid), signal) {
+        tracing::warn!(
+            pid,
+            signal = ?signal,
+            reason,
+            error = %error,
+            "failed to signal entrypoint process"
+        );
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_supervisor_shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(signal) => signal,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "Failed to install SIGTERM handler; supervisor shutdown detection disabled"
+            );
+            return std::future::pending::<&'static str>().await;
+        }
+    };
+
+    let _ = sigterm.recv().await;
+    info!("Received SIGTERM, shutting down supervisor process");
+    "SIGTERM"
+}
+
+#[cfg(not(unix))]
+async fn wait_for_supervisor_shutdown_signal() -> &'static str {
+    std::future::pending::<&'static str>().await
+}
+
+fn ssh_proxy_url_for_policy(
+    policy: &SandboxPolicy,
+    netns_proxy_host: Option<std::net::IpAddr>,
+) -> Option<String> {
+    if !matches!(policy.network.mode, NetworkMode::Proxy) {
+        return None;
+    }
+
+    let proxy = policy.network.proxy.as_ref()?;
+    if let Some(host) = netns_proxy_host {
+        let port = proxy.http_addr.map_or(3128, |addr| addr.port());
+        return Some(format!("http://{host}:{port}"));
+    }
+
+    proxy.http_addr.map(|addr| format!("http://{addr}"))
+}
+
 /// Eagerly fetch initial settings and install the agent-driven policy
 /// proposal skill if the flag is on at startup.
 ///
@@ -396,17 +542,12 @@ pub async fn run_process(
 ///
 /// Best-effort: any failure (no gateway, RPC error, install failure) is
 /// logged but does not fail sandbox startup.
-async fn install_initial_agent_skill(sandbox_id: Option<&str>, openshell_endpoint: Option<&str>) {
+async fn install_initial_agent_skill(
+    sandbox_id: Option<&str>,
+    openshell_endpoint: Option<&str>,
+    agent_proposals: &AgentProposals,
+) {
     use openshell_core::proto::setting_value;
-    use std::sync::atomic::Ordering;
-
-    let Some(flag) = openshell_core::proposals::AGENT_PROPOSALS_ENABLED.get() else {
-        // The orchestrator is responsible for setting the OnceLock before
-        // calling run_process. If it isn't set, behave as if the flag is
-        // off and skip the install.
-        tracing::debug!("AGENT_PROPOSALS_ENABLED not initialized; skipping skill install");
-        return;
-    };
 
     if let (Some(id), Some(endpoint)) = (sandbox_id, openshell_endpoint)
         && let Ok(client) =
@@ -423,10 +564,10 @@ async fn install_initial_agent_skill(sandbox_id: Option<&str>, openshell_endpoin
                 _ => None,
             })
             .unwrap_or(false);
-        flag.store(initial, Ordering::Relaxed);
+        agent_proposals.set_enabled(initial);
     }
 
-    if openshell_core::proposals::agent_proposals_enabled() {
+    if agent_proposals.enabled() {
         match crate::skills::install_static_skills() {
             Ok(installed) => info!(
                 path = %installed.policy_advisor.display(),
@@ -441,5 +582,55 @@ async fn install_initial_agent_skill(sandbox_id: Option<&str>, openshell_endpoin
         tracing::debug!(
             "agent_policy_proposals_enabled is false at startup; skipping skill install"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openshell_core::policy::{
+        FilesystemPolicy, LandlockPolicy, NetworkMode, NetworkPolicy, ProcessPolicy, ProxyPolicy,
+    };
+
+    fn policy(mode: NetworkMode, http_addr: Option<std::net::SocketAddr>) -> SandboxPolicy {
+        SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy {
+                mode,
+                proxy: http_addr.map(|http_addr| ProxyPolicy {
+                    http_addr: Some(http_addr),
+                }),
+            },
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy::default(),
+        }
+    }
+
+    #[test]
+    fn ssh_proxy_url_uses_policy_addr_without_netns() {
+        let policy = policy(NetworkMode::Proxy, Some(([127, 0, 0, 1], 3128).into()));
+
+        assert_eq!(
+            ssh_proxy_url_for_policy(&policy, None).as_deref(),
+            Some("http://127.0.0.1:3128")
+        );
+    }
+
+    #[test]
+    fn ssh_proxy_url_prefers_netns_host_with_policy_port() {
+        let policy = policy(NetworkMode::Proxy, Some(([127, 0, 0, 1], 8080).into()));
+
+        assert_eq!(
+            ssh_proxy_url_for_policy(&policy, Some([10, 200, 0, 1].into())).as_deref(),
+            Some("http://10.200.0.1:8080")
+        );
+    }
+
+    #[test]
+    fn ssh_proxy_url_skips_non_proxy_mode() {
+        let policy = policy(NetworkMode::Allow, Some(([127, 0, 0, 1], 3128).into()));
+
+        assert_eq!(ssh_proxy_url_for_policy(&policy, None), None);
     }
 }

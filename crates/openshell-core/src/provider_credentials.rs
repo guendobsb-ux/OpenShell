@@ -63,6 +63,63 @@ impl ProviderCredentialState {
         }
     }
 
+    /// Build a static provider state from an already-prepared child
+    /// environment snapshot.
+    ///
+    /// Kubernetes sidecar topology uses this in the process-only supervisor:
+    /// the network sidecar owns provider credential resolvers and sends the
+    /// workload-facing env map over a local control channel. The process leaf
+    /// must inject that map into child processes without re-placeholderizing it
+    /// or holding the gateway-side resolver material.
+    pub fn from_child_env_snapshot(revision: u64, child_env: HashMap<String, String>) -> Self {
+        let snapshot = Arc::new(ProviderCredentialSnapshot {
+            revision,
+            child_env,
+            dynamic_credentials: HashMap::new(),
+        });
+
+        Self {
+            inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
+                current: snapshot,
+                generations: VecDeque::new(),
+                current_resolver: None,
+                combined_resolver: None,
+                suppressed_keys: HashSet::new(),
+            })),
+        }
+    }
+
+    /// Install an already-prepared child environment snapshot.
+    ///
+    /// This is intentionally narrower than [`Self::install_environment`]: it
+    /// updates only the workload-facing env map and clears resolver state so a
+    /// process that does not own gateway/provider resolver material can still
+    /// pick up refreshed provider env for future child processes.
+    pub fn install_child_env_snapshot(
+        &self,
+        revision: u64,
+        mut child_env: HashMap<String, String>,
+    ) -> usize {
+        let mut inner = self
+            .inner
+            .write()
+            .expect("provider credential state poisoned");
+
+        for key in &inner.suppressed_keys {
+            child_env.remove(key);
+        }
+
+        inner.current = Arc::new(ProviderCredentialSnapshot {
+            revision,
+            child_env,
+            dynamic_credentials: HashMap::new(),
+        });
+        inner.generations.clear();
+        inner.current_resolver = None;
+        inner.combined_resolver = None;
+        inner.current.child_env.len()
+    }
+
     pub fn snapshot(&self) -> Arc<ProviderCredentialSnapshot> {
         self.inner
             .read()
@@ -186,7 +243,7 @@ impl ProviderCredentialState {
                         DEFAULT_EXPIRES_IN
                     } else {
                         let now = crate::time::now_ms();
-                        (expires_at_ms - now) / 1000
+                        expires_at_ms.saturating_sub(now) / 1000
                     }
                 },
             );
@@ -531,6 +588,27 @@ mod tests {
     }
 
     #[test]
+    fn gcp_token_response_handles_already_expired_token_without_panic() {
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([("GCP_ADC_ACCESS_TOKEN".to_string(), "adc-tok".to_string())]),
+            HashMap::from([("GCP_ADC_ACCESS_TOKEN".to_string(), now_ms - 1_000)]),
+            HashMap::new(),
+        );
+        assert!(
+            state.gcp_token_response().is_none(),
+            "expired token should be skipped rather than panic"
+        );
+    }
+
+    #[test]
     fn child_env_with_gcp_resolved_resolves_vertex_vars_without_metadata_host() {
         let state = ProviderCredentialState::from_environment(
             1,
@@ -591,6 +669,89 @@ mod tests {
         assert!(
             !state.snapshot().child_env.contains_key("GCE_METADATA_HOST"),
             "suppressed key must not reappear after install_environment"
+        );
+    }
+
+    #[test]
+    fn child_env_snapshot_install_updates_env_without_resolver_material() {
+        let state = ProviderCredentialState::from_child_env_snapshot(
+            1,
+            HashMap::from([
+                ("GITHUB_TOKEN".to_string(), "old".to_string()),
+                ("GCE_METADATA_HOST".to_string(), "marker".to_string()),
+            ]),
+        );
+        state.remove_env_key("GCE_METADATA_HOST");
+
+        let env_count = state.install_child_env_snapshot(
+            2,
+            HashMap::from([
+                ("GITHUB_TOKEN".to_string(), "new".to_string()),
+                ("GCE_METADATA_HOST".to_string(), "marker".to_string()),
+            ]),
+        );
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.revision, 2);
+        assert_eq!(env_count, 1);
+        assert_eq!(
+            snapshot.child_env.get("GITHUB_TOKEN").map(String::as_str),
+            Some("new")
+        );
+        assert!(!snapshot.child_env.contains_key("GCE_METADATA_HOST"));
+        assert!(
+            state.resolver().is_none(),
+            "child-env snapshots must not install provider resolver material"
+        );
+    }
+
+    #[test]
+    fn stale_generation_falls_back_to_current_credential_after_retention_window() {
+        let state = ProviderCredentialState::from_environment(
+            10,
+            HashMap::from([("GITHUB_TOKEN".to_string(), "old".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+
+        for revision in 11..20 {
+            state.install_environment(
+                revision,
+                HashMap::from([("GITHUB_TOKEN".to_string(), format!("new-{revision}"))]),
+                HashMap::new(),
+                HashMap::new(),
+            );
+        }
+
+        let resolver = state.resolver().expect("resolver");
+        assert_eq!(
+            resolver.resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
+            Some("new-19")
+        );
+    }
+
+    #[test]
+    fn stale_removed_generation_fails_closed_after_retention_window() {
+        let state = ProviderCredentialState::from_environment(
+            10,
+            HashMap::from([("GITHUB_TOKEN".to_string(), "old".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+
+        for revision in 11..20 {
+            state.install_environment(
+                revision,
+                HashMap::from([("OTHER_TOKEN".to_string(), format!("other-{revision}"))]),
+                HashMap::new(),
+                HashMap::new(),
+            );
+        }
+
+        let resolver = state.resolver().expect("retained resolver");
+        assert_eq!(
+            resolver.resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
+            None
         );
     }
 }

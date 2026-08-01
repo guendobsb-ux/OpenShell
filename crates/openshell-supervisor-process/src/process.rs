@@ -11,7 +11,7 @@ use crate::netns::NetworkNamespace;
 use crate::sandbox;
 use miette::{IntoDiagnostic, Result};
 use nix::sys::signal::{self, Signal};
-use nix::unistd::{Group, Pid, User};
+use nix::unistd::{Gid, Group, Pid, Uid, User};
 use openshell_core::policy::{NetworkMode, SandboxPolicy};
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -26,12 +26,99 @@ use std::process::Stdio;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 use tokio::process::{Child, Command};
-use tracing::debug;
+use tracing::{debug, info};
+
+/// Process/filesystem enforcement performed by the process supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessEnforcementMode {
+    /// Preserve the existing supervisor behavior: prepare filesystem policy,
+    /// drop privileges, and apply Landlock/seccomp to workload processes.
+    Full,
+    /// Preserve process launch and SSH/session behavior, but skip controls
+    /// that require root or extra Linux capabilities. Kubernetes sidecar mode
+    /// uses this when network policy is enforced by the network sidecar.
+    NetworkOnly,
+}
+
+/// Numeric identity components resolved once from driver-owned metadata.
+///
+/// A component is `None` when the corresponding policy field was explicit and
+/// must continue through the existing policy identity path. OCI-derived
+/// components are carried numerically so later filesystem setup and direct/SSH
+/// privilege drops cannot resolve them differently through NSS.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResolvedProcessIdentity {
+    uid: Option<u32>,
+    gid: Option<u32>,
+}
+
+impl ResolvedProcessIdentity {
+    #[must_use]
+    pub const fn new(uid: Option<u32>, gid: Option<u32>) -> Self {
+        Self { uid, gid }
+    }
+
+    #[must_use]
+    pub const fn uid(self) -> Option<u32> {
+        self.uid
+    }
+
+    #[must_use]
+    pub const fn gid(self) -> Option<u32> {
+        self.gid
+    }
+
+    /// Whether at least one process identity component came from OCI `USER`.
+    ///
+    /// Platform-resolved identities are written directly into the policy and
+    /// return the default value, so this is specific to Docker/Podman OCI
+    /// fallback without adding another driver contract.
+    #[must_use]
+    pub const fn uses_oci_user_fallback(self) -> bool {
+        self.uid.is_some() || self.gid.is_some()
+    }
+}
+
+impl ProcessEnforcementMode {
+    #[must_use]
+    pub const fn uses_privileged_process_setup(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    #[must_use]
+    pub const fn enforces_child_sandbox(self) -> bool {
+        matches!(self, Self::Full | Self::NetworkOnly)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_child_sandbox(
+    policy: &SandboxPolicy,
+    workdir: Option<&str>,
+    enforcement_mode: ProcessEnforcementMode,
+) -> Result<Option<sandbox::linux::PreparedSandbox>> {
+    if !enforcement_mode.enforces_child_sandbox() {
+        return Ok(None);
+    }
+
+    let prepared = if enforcement_mode.uses_privileged_process_setup() {
+        sandbox::linux::prepare(policy, workdir)
+    } else {
+        sandbox::linux::prepare_current_user(policy, workdir)
+    }?;
+    Ok(Some(prepared))
+}
 
 const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
+    openshell_core::sandbox_env::OCI_IMAGE_USER,
+    openshell_core::sandbox_env::SANDBOX_UID,
+    openshell_core::sandbox_env::SANDBOX_GID,
     openshell_core::sandbox_env::SANDBOX_TOKEN,
     openshell_core::sandbox_env::SANDBOX_TOKEN_FILE,
     openshell_core::sandbox_env::K8S_SA_TOKEN_FILE,
+    openshell_core::sandbox_env::TLS_CA,
+    openshell_core::sandbox_env::TLS_CERT,
+    openshell_core::sandbox_env::TLS_KEY,
     openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
 ];
 
@@ -152,6 +239,46 @@ fn parse_pids_max(contents: &str) -> RuntimePidLimitStatus {
         Err(err) => {
             RuntimePidLimitStatus::Unavailable(format!("invalid pids.max value {raw:?}: {err}"))
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn drop_capability_bounding_set() -> Result<()> {
+    let clear_result = capctl::caps::bounding::clear();
+    let remaining = capctl::caps::bounding::probe();
+
+    validate_capability_bounding_set_clear(
+        clear_result,
+        remaining,
+        capctl::caps::bounding::clear_unknown,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn validate_capability_bounding_set_clear(
+    clear_result: capctl::Result<()>,
+    remaining: capctl::caps::CapSet,
+    clear_unknown: impl FnOnce() -> capctl::Result<()>,
+) -> Result<()> {
+    match clear_result {
+        Ok(()) if remaining.is_empty() => Ok(()),
+        Ok(()) => Err(miette::miette!(
+            "Failed to clear child capability bounding set: capabilities remain raised: {remaining:?}"
+        )),
+        Err(err) if err.code() == libc::EPERM && remaining.is_empty() => match clear_unknown() {
+            Ok(()) => {
+                debug!(
+                    "CAP_SETPCAP is unavailable, but the child capability bounding set is already empty"
+                );
+                Ok(())
+            }
+            Err(unknown_err) => Err(miette::miette!(
+                "Failed to clear unknown child capability bounding set entries: {unknown_err}"
+            )),
+        },
+        Err(err) => Err(miette::miette!(
+            "Failed to clear child capability bounding set: {err}"
+        )),
     }
 }
 
@@ -403,6 +530,8 @@ impl ProcessHandle {
         workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
+        resolved_identity: ResolvedProcessIdentity,
+        enforcement_mode: ProcessEnforcementMode,
         netns: Option<&NetworkNamespace>,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
@@ -413,6 +542,8 @@ impl ProcessHandle {
             workdir,
             interactive,
             policy,
+            resolved_identity,
+            enforcement_mode,
             netns.and_then(NetworkNamespace::ns_fd),
             ca_paths,
             provider_env,
@@ -425,12 +556,15 @@ impl ProcessHandle {
     ///
     /// Returns an error if the process fails to start.
     #[cfg(not(target_os = "linux"))]
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         program: &str,
         args: &[String],
         workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
+        resolved_identity: ResolvedProcessIdentity,
+        enforcement_mode: ProcessEnforcementMode,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
@@ -440,6 +574,8 @@ impl ProcessHandle {
             workdir,
             interactive,
             policy,
+            resolved_identity,
+            enforcement_mode,
             ca_paths,
             provider_env,
         )
@@ -453,6 +589,8 @@ impl ProcessHandle {
         workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
+        resolved_identity: ResolvedProcessIdentity,
+        enforcement_mode: ProcessEnforcementMode,
         netns_fd: Option<RawFd>,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
@@ -512,18 +650,26 @@ impl ProcessHandle {
         // process where the tracing subscriber is functional. The child's
         // pre_exec context cannot reliably emit structured logs.
         #[cfg(target_os = "linux")]
-        sandbox::linux::log_sandbox_readiness(policy, workdir);
+        if enforcement_mode.enforces_child_sandbox() {
+            sandbox::linux::log_sandbox_readiness(policy, workdir);
+        }
 
-        // Phase 1 (as root): Prepare Landlock ruleset by opening PathFds.
-        // This MUST happen before drop_privileges() so that root-only paths
-        // (e.g. mode 700 directories) can be opened. See issue #803.
+        // Phase 1: Prepare Landlock ruleset by opening PathFds.
+        // In full mode this runs before drop_privileges() so root-only paths
+        // can be opened. In sidecar network-only mode the container already
+        // runs as the sandbox UID, so inaccessible paths are unavailable to
+        // the workload and best-effort compatibility skips them.
         #[cfg(target_os = "linux")]
-        let prepared_sandbox = sandbox::linux::prepare(policy, workdir)
+        let prepared_sandbox = prepare_child_sandbox(policy, workdir, enforcement_mode)
             .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
         #[cfg(target_os = "linux")]
-        let supervisor_identity_mount = supervisor_identity_mount_from_env().map_err(|err| {
-            miette::miette!("Failed to prepare supervisor identity isolation: {err}")
-        })?;
+        let supervisor_identity_mount = if enforcement_mode.uses_privileged_process_setup() {
+            supervisor_identity_mount_from_env().map_err(|err| {
+                miette::miette!("Failed to prepare supervisor identity isolation: {err}")
+            })?
+        } else {
+            None
+        };
 
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
@@ -535,7 +681,7 @@ impl ProcessHandle {
             // Wrap in Option so we can .take() it out of the FnMut closure.
             // pre_exec is only called once (after fork, before exec).
             #[cfg(target_os = "linux")]
-            let mut prepared_sandbox = Some(prepared_sandbox);
+            let mut prepared_sandbox = prepared_sandbox;
             #[allow(unsafe_code)]
             unsafe {
                 cmd.pre_exec(move || {
@@ -560,8 +706,10 @@ impl ProcessHandle {
                     // Drop privileges. initgroups/setgid/setuid need access to
                     // /etc/group and /etc/passwd which would be blocked if
                     // Landlock were already enforced.
-                    drop_privileges(&policy)
-                        .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    if enforcement_mode.uses_privileged_process_setup() {
+                        drop_privileges_with_identity(&policy, resolved_identity)
+                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    }
 
                     harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
 
@@ -589,12 +737,15 @@ impl ProcessHandle {
     }
 
     #[cfg(not(target_os = "linux"))]
+    #[allow(clippy::too_many_arguments)]
     fn spawn_impl(
         program: &str,
         args: &[String],
         workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
+        resolved_identity: ResolvedProcessIdentity,
+        enforcement_mode: ProcessEnforcementMode,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
@@ -657,13 +808,17 @@ impl ProcessHandle {
                     // Drop privileges before applying sandbox restrictions.
                     // initgroups/setgid/setuid need access to /etc/group and /etc/passwd
                     // which may be blocked by Landlock.
-                    drop_privileges(&policy)
-                        .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    if enforcement_mode.uses_privileged_process_setup() {
+                        drop_privileges_with_identity(&policy, resolved_identity)
+                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    }
 
                     harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
 
-                    sandbox::apply(&policy, workdir.as_deref())
-                        .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    if enforcement_mode.enforces_child_sandbox() {
+                        sandbox::apply(&policy, workdir.as_deref())
+                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    }
 
                     Ok(())
                 });
@@ -748,17 +903,35 @@ impl Drop for ProcessHandle {
     }
 }
 
-/// Validate that the `sandbox` user exists in this image.
+/// Validate the configured process user.
 ///
-/// All sandbox images must include a `sandbox` user for privilege dropping.
-/// This check runs at supervisor startup (inside the container) where we can
-/// inspect `/etc/passwd`. If the user is missing, the sandbox fails fast
-/// with a clear error instead of silently running child processes as root.
+/// Numeric identities do not require a passwd entry. The legacy explicit
+/// `"sandbox"` identity and other names must resolve in `/etc/passwd`.
 #[cfg(unix)]
 pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
-    let user_name = policy.process.run_as_user.as_deref().unwrap_or("sandbox");
+    let identity = policy.process.run_as_user.as_deref().unwrap_or("sandbox");
 
-    if user_name.is_empty() || user_name == "sandbox" {
+    if let Ok(uid) = identity.parse::<u32>() {
+        if !(MIN_SANDBOX_UID..=MAX_SANDBOX_UID).contains(&uid) {
+            return Err(miette::miette!(
+                "process user UID must be in range [{MIN_SANDBOX_UID}, {MAX_SANDBOX_UID}]"
+            ));
+        }
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                .severity(openshell_ocsf::SeverityId::Informational)
+                .status(openshell_ocsf::StatusId::Success)
+                .state(openshell_ocsf::StateId::Enabled, "validated")
+                .message(format!(
+                    "Accepted numeric UID {identity} (no passwd entry required)"
+                ))
+                .build()
+        );
+        return Ok(());
+    }
+
+    // Legacy explicit "sandbox" name — must exist in /etc/passwd.
+    if identity == "sandbox" {
         match User::from_name("sandbox") {
             Ok(Some(_)) => {
                 openshell_ocsf::ocsf_emit!(
@@ -772,18 +945,135 @@ pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
             }
             Ok(None) => {
                 return Err(miette::miette!(
-                    "sandbox user 'sandbox' not found in image; \
-                     all sandbox images must include a 'sandbox' user and group"
+                    "explicit process user 'sandbox' was not found in the image"
                 ));
             }
             Err(e) => {
                 return Err(miette::miette!("failed to look up 'sandbox' user: {e}"));
             }
         }
+    } else if !identity.is_empty() {
+        // Other names are supported by local/offline policy paths and must
+        // resolve before privilege dropping.
+        match User::from_name(identity) {
+            Ok(Some(_)) => {
+                tracing::warn!(identity, "named process user accepted via passwd entry");
+            }
+            Ok(None) => {
+                return Err(miette::miette!(
+                    "unrecognized sandbox identity '{identity}'; \
+                     expected 'sandbox' or a numeric UID in range [{MIN_SANDBOX_UID}, {MAX_SANDBOX_UID}]"
+                ));
+            }
+            Err(e) => {
+                return Err(miette::miette!(
+                    "failed to look up identity '{identity}': {e}"
+                ));
+            }
+        }
     }
 
     Ok(())
 }
+
+/// Validate that the configured sandbox group identity is acceptable.
+///
+/// Mirrors [`validate_sandbox_user`] for the group dimension.
+#[cfg(unix)]
+pub fn validate_sandbox_group(policy: &SandboxPolicy) -> Result<()> {
+    let identity = policy.process.run_as_group.as_deref().unwrap_or("sandbox");
+
+    if let Ok(gid) = identity.parse::<u32>() {
+        if !(MIN_SANDBOX_UID..=MAX_SANDBOX_UID).contains(&gid) {
+            return Err(miette::miette!(
+                "process group GID must be in range [{MIN_SANDBOX_UID}, {MAX_SANDBOX_UID}]"
+            ));
+        }
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                .severity(openshell_ocsf::SeverityId::Informational)
+                .status(openshell_ocsf::StatusId::Success)
+                .state(openshell_ocsf::StateId::Enabled, "validated")
+                .message(format!(
+                    "Accepted numeric GID {identity} (no group entry required)"
+                ))
+                .build()
+        );
+        return Ok(());
+    }
+
+    if identity == "sandbox" {
+        match Group::from_name("sandbox") {
+            Ok(Some(_)) => {
+                openshell_ocsf::ocsf_emit!(
+                    openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                        .severity(openshell_ocsf::SeverityId::Informational)
+                        .status(openshell_ocsf::StatusId::Success)
+                        .state(openshell_ocsf::StateId::Enabled, "validated")
+                        .message("Validated 'sandbox' group exists in image")
+                        .build()
+                );
+            }
+            Ok(None) => {
+                return Err(miette::miette!(
+                    "explicit process group 'sandbox' was not found in the image"
+                ));
+            }
+            Err(e) => {
+                return Err(miette::miette!("failed to look up 'sandbox' group: {e}"));
+            }
+        }
+    } else if !identity.is_empty() {
+        match Group::from_name(identity) {
+            Ok(Some(_)) => {
+                tracing::warn!(identity, "named process group accepted via group entry");
+            }
+            Ok(None) => {
+                return Err(miette::miette!(
+                    "unrecognized sandbox group identity '{identity}'; \
+                     expected 'sandbox' or a numeric GID in range [{MIN_SANDBOX_UID}, {MAX_SANDBOX_UID}]"
+                ));
+            }
+            Err(e) => {
+                return Err(miette::miette!(
+                    "failed to look up group identity '{identity}': {e}"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+pub fn validate_sandbox_user_with_identity(
+    policy: &SandboxPolicy,
+    resolved_identity: ResolvedProcessIdentity,
+) -> Result<()> {
+    let Some(uid) = resolved_identity.uid() else {
+        return validate_sandbox_user(policy);
+    };
+    if uid == 0 {
+        return Err(miette::miette!("process user must not select UID 0"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub fn validate_sandbox_group_with_identity(
+    policy: &SandboxPolicy,
+    resolved_identity: ResolvedProcessIdentity,
+) -> Result<()> {
+    let Some(gid) = resolved_identity.gid() else {
+        return validate_sandbox_group(policy);
+    };
+    if gid == 0 {
+        return Err(miette::miette!("process group must not select GID 0"));
+    }
+    Ok(())
+}
+
+pub use openshell_policy::{MAX_SANDBOX_UID, MIN_SANDBOX_UID};
 
 /// Prepare a `read_write` path for the sandboxed process.
 ///
@@ -818,14 +1108,223 @@ fn prepare_read_write_path(path: &Path) -> Result<bool> {
     }
 }
 
+/// Update `/etc/passwd` and `/etc/group` so the "sandbox" user/group entries
+/// match the driver-injected UID/GID from environment variables.
+///
+/// When `OPENSHELL_SANDBOX_UID` is set, the image-baked "sandbox" entry may
+/// have a different UID. Updating the files ensures `whoami`, `id`, `ls -l`,
+/// SSH sessions, and `initgroups` resolve the sandbox identity correctly.
+/// If no "sandbox" entry exists, one is appended.
+#[cfg(unix)]
+pub fn update_sandbox_passwd_entries() -> Result<()> {
+    let uid_str = match std::env::var(openshell_core::sandbox_env::SANDBOX_UID) {
+        Ok(v) if !v.is_empty() => v,
+        _ => return Ok(()),
+    };
+    let gid_str = match std::env::var(openshell_core::sandbox_env::SANDBOX_GID) {
+        Ok(v) if !v.is_empty() => v,
+        _ => uid_str.clone(),
+    };
+
+    let _: u32 = uid_str
+        .parse()
+        .map_err(|e| miette::miette!("invalid OPENSHELL_SANDBOX_UID '{uid_str}': {e}"))?;
+    let _: u32 = gid_str
+        .parse()
+        .map_err(|e| miette::miette!("invalid OPENSHELL_SANDBOX_GID '{gid_str}': {e}"))?;
+
+    update_passwd_file(&uid_str, &gid_str)?;
+    update_group_file(&gid_str)?;
+
+    info!(
+        uid = %uid_str,
+        gid = %gid_str,
+        "Updated /etc/passwd and /etc/group for sandbox identity"
+    );
+    Ok(())
+}
+
+/// Rewrite the `sandbox` line in `/etc/passwd` with the given UID/GID,
+/// or append a new entry if none exists.
+#[cfg(unix)]
+fn update_passwd_file(uid: &str, gid: &str) -> Result<()> {
+    rewrite_passwd_at(Path::new("/etc/passwd"), uid, gid)
+}
+
+/// Rewrite the `sandbox` line in `/etc/group` with the given GID,
+/// or append a new entry if none exists.
+#[cfg(unix)]
+fn update_group_file(gid: &str) -> Result<()> {
+    rewrite_group_at(Path::new("/etc/group"), gid)
+}
+
+#[cfg(unix)]
+fn rewrite_passwd_at(path: &Path, uid: &str, gid: &str) -> Result<()> {
+    let content = std::fs::read_to_string(path).into_diagnostic()?;
+
+    let mut found = false;
+    let mut lines: Vec<String> = content
+        .lines()
+        .map(|line| {
+            if line.starts_with("sandbox:") {
+                found = true;
+                let fields: Vec<&str> = line.split(':').collect();
+                if let [name, pass, _, _, gecos, home, shell, ..] = fields.as_slice() {
+                    format!("{name}:{pass}:{uid}:{gid}:{gecos}:{home}:{shell}")
+                } else {
+                    line.to_string()
+                }
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+
+    if !found {
+        lines.push(format!("sandbox:x:{uid}:{gid}::/sandbox:/bin/sh"));
+    }
+
+    let mut output = lines.join("\n");
+    if content.ends_with('\n') || !found {
+        output.push('\n');
+    }
+
+    std::fs::write(path, output).into_diagnostic()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn rewrite_group_at(path: &Path, gid: &str) -> Result<()> {
+    let content = std::fs::read_to_string(path).into_diagnostic()?;
+
+    let mut found = false;
+    let mut lines: Vec<String> = content
+        .lines()
+        .map(|line| {
+            if line.starts_with("sandbox:") {
+                found = true;
+                let fields: Vec<&str> = line.split(':').collect();
+                if let [name, pass, _, members, ..] = fields.as_slice() {
+                    format!("{name}:{pass}:{gid}:{members}")
+                } else {
+                    line.to_string()
+                }
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+
+    if !found {
+        lines.push(format!("sandbox:x:{gid}:"));
+    }
+
+    let mut output = lines.join("\n");
+    if content.ends_with('\n') || !found {
+        output.push('\n');
+    }
+
+    std::fs::write(path, output).into_diagnostic()?;
+    Ok(())
+}
+
+/// Recursively chown a directory tree to the given UID/GID.
+///
+/// This retains the Kubernetes/OpenShift workspace reconciliation from before
+/// OCI image identity fallback. Symlinks are skipped, and read-only nested
+/// mounts are not traversed.
+#[cfg(unix)]
+fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
+    let meta = std::fs::symlink_metadata(root).into_diagnostic()?;
+    if meta.file_type().is_symlink() {
+        return Err(miette::miette!(
+            "path '{}' is a symlink — refusing to chown (potential privilege escalation)",
+            root.display()
+        ));
+    }
+
+    nix::unistd::chown(root, uid, gid).into_diagnostic()?;
+
+    if meta.is_dir() {
+        chown_children(root, uid, gid, &nix::unistd::chown)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn chown_children(
+    dir: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    do_chown: &impl Fn(&Path, Option<Uid>, Option<Gid>) -> nix::Result<()>,
+) -> Result<()> {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.into_diagnostic()?;
+                chown_recursive(&entry.path(), uid, gid, do_chown)?;
+            }
+        }
+        Err(error) => {
+            debug!(
+                path = %dir.display(),
+                %error,
+                "Cannot list directory during sandbox home chown"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn chown_recursive(
+    path: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    do_chown: &impl Fn(&Path, Option<Uid>, Option<Gid>) -> nix::Result<()>,
+) -> Result<()> {
+    let meta = std::fs::symlink_metadata(path).into_diagnostic()?;
+    if meta.file_type().is_symlink() {
+        debug!(path = %path.display(), "Skipping symlink during sandbox home chown");
+        return Ok(());
+    }
+
+    if let Err(error) = do_chown(path, uid, gid) {
+        if error == nix::errno::Errno::EROFS {
+            debug!(path = %path.display(), "Skipping read-only path during sandbox home chown");
+            return Ok(());
+        }
+        return Err(error).into_diagnostic();
+    }
+
+    if meta.is_dir() {
+        chown_children(path, uid, gid, do_chown)?;
+    }
+
+    Ok(())
+}
+
 /// Prepare filesystem for the sandboxed process.
 ///
 /// Creates `read_write` directories if they don't exist and sets ownership
 /// on newly-created paths to the configured sandbox user/group. This runs as
 /// the supervisor (root) before forking the child process.
+///
+/// Accepts both name-based identities (resolved via `/etc/passwd`) and numeric
+/// UIDs/GIDs (passed directly to `chown` without a passwd lookup).
 #[cfg(unix)]
 pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
+    prepare_filesystem_with_identity(policy, ResolvedProcessIdentity::default())
+}
+
+#[cfg(unix)]
+pub fn prepare_filesystem_with_identity(
+    policy: &SandboxPolicy,
+    resolved_identity: ResolvedProcessIdentity,
+) -> Result<()> {
     use nix::unistd::chown;
+    use nix::unistd::{Gid, Uid};
 
     let user_name = match policy.process.run_as_user.as_deref() {
         Some(name) if !name.is_empty() => Some(name),
@@ -841,27 +1340,28 @@ pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
         return Ok(());
     }
 
-    // Resolve user and group
-    let uid = if let Some(name) = user_name {
-        Some(
-            User::from_name(name)
-                .into_diagnostic()?
-                .ok_or_else(|| miette::miette!("Sandbox user not found: {name}"))?
-                .uid,
-        )
-    } else {
-        None
+    // Resolve UID: numeric values are passed directly; names resolve via passwd.
+    let uid = match resolved_identity.uid() {
+        Some(uid) => Some(Uid::from_raw(uid)),
+        None => match user_name {
+            Some(name) if name.parse::<u32>().is_ok() => {
+                Some(Uid::from_raw(name.parse().into_diagnostic()?))
+            }
+            Some(name) => User::from_name(name).into_diagnostic()?.map(|u| u.uid),
+            _ => None,
+        },
     };
 
-    let gid = if let Some(name) = group_name {
-        Some(
-            Group::from_name(name)
-                .into_diagnostic()?
-                .ok_or_else(|| miette::miette!("Sandbox group not found: {name}"))?
-                .gid,
-        )
-    } else {
-        None
+    // Resolve GID: numeric values are passed directly; names resolve via group.
+    let gid = match resolved_identity.gid() {
+        Some(gid) => Some(Gid::from_raw(gid)),
+        None => match group_name {
+            Some(name) if name.parse::<u32>().is_ok() => {
+                Some(Gid::from_raw(name.parse().into_diagnostic()?))
+            }
+            Some(name) => Group::from_name(name).into_diagnostic()?.map(|g| g.gid),
+            _ => None,
+        },
     };
 
     // Create missing read_write paths and only chown the ones we created.
@@ -874,6 +1374,17 @@ pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
                 "Setting ownership on newly created read_write path"
             );
             chown(path, uid, gid).into_diagnostic()?;
+        }
+    }
+
+    // Retain the existing Kubernetes/OpenShift behavior for driver-injected
+    // numeric identities. Docker and Podman clear this variable and do not
+    // receive identity-specific workspace preparation.
+    if std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok_and(|uid| !uid.is_empty()) {
+        let sandbox_home = Path::new("/sandbox");
+        if sandbox_home.exists() {
+            info!(?uid, ?gid, "Chowning /sandbox for driver-injected UID/GID");
+            chown_sandbox_home(sandbox_home, uid, gid)?;
         }
     }
 
@@ -890,6 +1401,28 @@ pub fn prepare_filesystem(_policy: &SandboxPolicy) -> Result<()> {
 #[cfg(unix)]
 #[allow(clippy::similar_names)]
 pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
+    drop_privileges_with_identity(policy, ResolvedProcessIdentity::default())
+}
+
+#[cfg(unix)]
+fn should_clear_supplementary_groups(
+    current_uid: Uid,
+    target_uid: Uid,
+    user_name: Option<&str>,
+    resolved_identity: ResolvedProcessIdentity,
+) -> bool {
+    resolved_identity.uses_oci_user_fallback()
+        && target_uid != current_uid
+        && !(user_name.is_some_and(|name| name.parse::<u32>().is_err())
+            && resolved_identity.uid().is_none())
+}
+
+#[cfg(unix)]
+#[allow(clippy::similar_names)]
+pub fn drop_privileges_with_identity(
+    policy: &SandboxPolicy,
+    resolved_identity: ResolvedProcessIdentity,
+) -> Result<()> {
     let user_name = match policy.process.run_as_user.as_deref() {
         Some(name) if !name.is_empty() => Some(name),
         _ => None,
@@ -901,83 +1434,155 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
 
     // If no user/group is configured and we are running as root, fall back to
     // "sandbox:sandbox" instead of silently keeping root.  This covers the
-    // local/dev-mode path where policies are loaded from disk and never pass
-    // through the server-side `ensure_sandbox_process_identity` normalization.
+    // local/dev-mode path for drivers that provide no identity metadata.
     // For non-root runtimes, the no-op is safe -- we are already unprivileged.
     if user_name.is_none() && group_name.is_none() {
         if nix::unistd::geteuid().is_root() {
             let mut fallback = policy.clone();
             fallback.process.run_as_user = Some("sandbox".into());
             fallback.process.run_as_group = Some("sandbox".into());
-            return drop_privileges(&fallback);
+            return drop_privileges_with_identity(&fallback, resolved_identity);
         }
         return Ok(());
     }
 
-    let user = if let Some(name) = user_name {
-        User::from_name(name)
-            .into_diagnostic()?
-            .ok_or_else(|| miette::miette!("Sandbox user not found: {name}"))?
-    } else {
-        User::from_uid(nix::unistd::geteuid())
-            .into_diagnostic()?
-            .ok_or_else(|| miette::miette!("Failed to resolve current user"))?
+    // Resolve UID: numeric values are used directly; names resolve via passwd.
+    let target_uid = match resolved_identity.uid() {
+        Some(uid) => Uid::from_raw(uid),
+        None => match user_name {
+            Some(name) if name.parse::<u32>().is_ok() => {
+                Uid::from_raw(name.parse().into_diagnostic()?)
+            }
+            Some(name) => {
+                User::from_name(name)
+                    .into_diagnostic()?
+                    .ok_or_else(|| miette::miette!("Sandbox user not found: {name}"))?
+                    .uid
+            }
+            None => nix::unistd::geteuid(),
+        },
     };
 
-    let group = if let Some(name) = group_name {
-        Group::from_name(name)
-            .into_diagnostic()?
-            .ok_or_else(|| miette::miette!("Sandbox group not found: {name}"))?
-    } else {
-        Group::from_gid(user.gid)
-            .into_diagnostic()?
-            .ok_or_else(|| miette::miette!("Failed to resolve user primary group"))?
+    // Resolve group: if a numeric GID is configured use it directly.
+    // Otherwise try name resolution, then fall back to current user's primary group.
+    let target_gid = match resolved_identity.gid() {
+        Some(gid) => Gid::from_raw(gid),
+        None => match group_name {
+            Some(name) if name.parse::<u32>().is_ok() => {
+                Gid::from_raw(name.parse().into_diagnostic()?)
+            }
+            Some(name) => {
+                Group::from_name(name)
+                    .into_diagnostic()?
+                    .ok_or_else(|| miette::miette!("Sandbox group not found: {name}"))?
+                    .gid
+            }
+            None => match target_uid.as_raw() {
+                0 => nix::unistd::getegid(),
+                _ => Group::from_gid(
+                    User::from_uid(target_uid)
+                        .into_diagnostic()?
+                        .ok_or_else(|| {
+                            miette::miette!("Failed to resolve user from UID {target_uid}")
+                        })?
+                        .gid,
+                )
+                .into_diagnostic()?
+                .map_or_else(nix::unistd::getegid, |g| g.gid),
+            },
+        },
     };
 
-    if user_name.is_some() {
-        let user_cstr =
-            CString::new(user.name.clone()).map_err(|_| miette::miette!("Invalid user name"))?;
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "haiku",
-            target_os = "redox"
-        ))]
-        {
-            let _ = user_cstr;
-        }
-        #[cfg(not(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "haiku",
-            target_os = "redox"
-        )))]
-        {
-            nix::unistd::initgroups(user_cstr.as_c_str(), group.gid).into_diagnostic()?;
+    // Resolve the name for initgroups only for the existing explicit-policy
+    // path. OCI-derived users carry a numeric UID from the bounded parser and
+    // must not be looked up again through NSS.
+    let user_name_is_numeric = user_name.is_some_and(|n| n.parse::<u32>().is_ok());
+    let initgroups_name =
+        if user_name.is_some() && !user_name_is_numeric && resolved_identity.uid().is_none() {
+            Some(
+                User::from_uid(target_uid)
+                    .into_diagnostic()?
+                    .ok_or_else(|| {
+                        miette::miette!("Failed to resolve user record for UID {target_uid}")
+                    })?
+                    .name,
+            )
+        } else {
+            None
+        };
+
+    if target_uid != nix::unistd::geteuid() {
+        if should_clear_supplementary_groups(
+            nix::unistd::geteuid(),
+            target_uid,
+            user_name,
+            resolved_identity,
+        ) {
+            // OCI-derived users do not have a trustworthy NSS
+            // supplementary-group source. Clear the root supervisor's
+            // inherited groups before changing UID/GID. Platform-resolved and
+            // explicit numeric identities retain their pre-OCI behavior.
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "haiku",
+                target_os = "redox"
+            )))]
+            nix::unistd::setgroups(&[]).into_diagnostic()?;
+        } else if let Some(ref user_name) = initgroups_name {
+            let user_cstr = CString::new(user_name.as_str())
+                .map_err(|_| miette::miette!("Invalid user name"))?;
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "haiku",
+                target_os = "redox"
+            ))]
+            {
+                let _ = user_cstr;
+            }
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "haiku",
+                target_os = "redox"
+            )))]
+            {
+                nix::unistd::initgroups(user_cstr.as_c_str(), target_gid).into_diagnostic()?;
+            }
         }
     }
 
-    nix::unistd::setgid(group.gid).into_diagnostic()?;
+    if target_gid != nix::unistd::getegid() {
+        nix::unistd::setgid(target_gid).into_diagnostic()?;
+    }
 
     // Verify effective GID actually changed (defense-in-depth, CWE-250 / CERT POS37-C)
     let effective_gid = nix::unistd::getegid();
-    if effective_gid != group.gid {
+    if effective_gid != target_gid {
         return Err(miette::miette!(
             "Privilege drop verification failed: expected effective GID {}, got {}",
-            group.gid,
+            target_gid,
             effective_gid
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    if nix::unistd::geteuid().is_root() {
+        drop_capability_bounding_set()?;
+    }
+
     if user_name.is_some() {
-        nix::unistd::setuid(user.uid).into_diagnostic()?;
+        if target_uid != nix::unistd::geteuid() {
+            nix::unistd::setuid(target_uid).into_diagnostic()?;
+        }
 
         // Verify effective UID actually changed (defense-in-depth, CWE-250 / CERT POS37-C)
         let effective_uid = nix::unistd::geteuid();
-        if effective_uid != user.uid {
+        if effective_uid != target_uid {
             return Err(miette::miette!(
                 "Privilege drop verification failed: expected effective UID {}, got {}",
-                user.uid,
+                target_uid,
                 effective_uid
             ));
         }
@@ -985,11 +1590,11 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
         // Verify root cannot be re-acquired (CERT POS37-C hardening).
         // If we dropped from root, setuid(0) must fail; success means privileges
         // were not fully relinquished.
-        if nix::unistd::setuid(nix::unistd::Uid::from_raw(0)).is_ok() && user.uid.as_raw() != 0 {
+        if nix::unistd::setuid(Uid::from_raw(0)).is_ok() && target_uid.as_raw() != 0 {
             return Err(miette::miette!(
                 "Privilege drop verification failed: process can still re-acquire root (UID 0) \
                  after switching to UID {}",
-                user.uid
+                target_uid
             ));
         }
     }
@@ -1084,6 +1689,217 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn explicit_identity_rejects_non_root_system_ids() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("101".into()),
+            run_as_group: Some("102".into()),
+        });
+
+        assert!(validate_sandbox_user(&policy).is_err());
+        assert!(validate_sandbox_group(&policy).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolved_oci_identity_accepts_non_root_system_ids() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("app".into()),
+            run_as_group: Some("staff".into()),
+        });
+        let resolved = ResolvedProcessIdentity::new(Some(101), Some(102));
+
+        assert!(validate_sandbox_user_with_identity(&policy, resolved).is_ok());
+        assert!(validate_sandbox_group_with_identity(&policy, resolved).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn completed_runtime_identity_rejects_numeric_root() {
+        let root_user = policy_with_process(ProcessPolicy {
+            run_as_user: Some("0".into()),
+            run_as_group: Some("102".into()),
+        });
+        let root_group = policy_with_process(ProcessPolicy {
+            run_as_user: Some("101".into()),
+            run_as_group: Some("0".into()),
+        });
+
+        assert!(validate_sandbox_user(&root_user).is_err());
+        assert!(validate_sandbox_group(&root_group).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolved_oci_components_do_not_repeat_nss_validation() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("__oci_name_not_in_host_nss__".into()),
+            run_as_group: Some("__oci_group_not_in_host_nss__".into()),
+        });
+        let resolved = ResolvedProcessIdentity::new(Some(1234), Some(1235));
+
+        assert!(validate_sandbox_user_with_identity(&policy, resolved).is_ok());
+        assert!(validate_sandbox_group_with_identity(&policy, resolved).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn explicit_policy_components_keep_existing_validation_path() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("__explicit_name_not_in_host_nss__".into()),
+            run_as_group: Some("__oci_group_not_in_host_nss__".into()),
+        });
+        let resolved = ResolvedProcessIdentity::new(None, Some(1235));
+
+        assert!(validate_sandbox_user_with_identity(&policy, resolved).is_err());
+        assert!(validate_sandbox_group_with_identity(&policy, resolved).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn only_oci_numeric_user_paths_clear_supplementary_groups_before_uid_drop() {
+        let current_uid = Uid::from_raw(0);
+        let target_uid = Uid::from_raw(1234);
+
+        assert!(!should_clear_supplementary_groups(
+            current_uid,
+            target_uid,
+            Some("1234"),
+            ResolvedProcessIdentity::default(),
+        ));
+        assert!(should_clear_supplementary_groups(
+            current_uid,
+            target_uid,
+            Some("1234"),
+            ResolvedProcessIdentity::new(None, Some(1235)),
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn supplementary_group_clearing_preserves_explicit_named_user_behavior() {
+        assert!(!should_clear_supplementary_groups(
+            Uid::from_raw(0),
+            Uid::from_raw(1234),
+            Some("app"),
+            ResolvedProcessIdentity::default(),
+        ));
+        assert!(!should_clear_supplementary_groups(
+            Uid::from_raw(1234),
+            Uid::from_raw(1234),
+            Some("1234"),
+            ResolvedProcessIdentity::new(None, Some(1235)),
+        ));
+    }
+
+    #[test]
+    fn full_enforcement_uses_privileged_setup_and_child_sandbox() {
+        assert!(ProcessEnforcementMode::Full.uses_privileged_process_setup());
+        assert!(ProcessEnforcementMode::Full.enforces_child_sandbox());
+    }
+
+    #[test]
+    fn network_only_enforcement_keeps_child_sandbox_without_privileged_setup() {
+        assert!(!ProcessEnforcementMode::NetworkOnly.uses_privileged_process_setup());
+        assert!(ProcessEnforcementMode::NetworkOnly.enforces_child_sandbox());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn capability_bounding_set_clear_available() -> bool {
+        capctl::caps::CapState::get_current()
+            .is_ok_and(|state| state.effective.has(capctl::caps::Cap::SETPCAP))
+            || capctl::caps::bounding::probe().is_empty()
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn capability_bounding_set_clear_accepts_empty_eperm() {
+        let remaining = capctl::caps::CapSet::empty();
+
+        assert!(
+            validate_capability_bounding_set_clear(
+                Err(capctl::Error::from_code(libc::EPERM)),
+                remaining,
+                || Ok(()),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn capability_bounding_set_clear_rejects_nonempty_eperm() {
+        let mut remaining = capctl::caps::CapSet::empty();
+        remaining.add(capctl::caps::Cap::CHOWN);
+
+        let result = validate_capability_bounding_set_clear(
+            Err(capctl::Error::from_code(libc::EPERM)),
+            remaining,
+            || panic!("unknown capabilities should not be checked when known caps remain"),
+        );
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to clear child capability bounding set")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn capability_bounding_set_clear_rejects_nonempty_success() {
+        let mut remaining = capctl::caps::CapSet::empty();
+        remaining.add(capctl::caps::Cap::CHOWN);
+
+        let result = validate_capability_bounding_set_clear(Ok(()), remaining, || {
+            panic!("unknown capabilities should not be checked when known caps remain")
+        });
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("capabilities remain raised")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn capability_bounding_set_clear_rejects_unknown_eperm() {
+        let remaining = capctl::caps::CapSet::empty();
+
+        let result = validate_capability_bounding_set_clear(
+            Err(capctl::Error::from_code(libc::EPERM)),
+            remaining,
+            || Err(capctl::Error::from_code(libc::EPERM)),
+        );
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to clear unknown child capability bounding set entries")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn capability_probe_child() {
+        if std::env::var_os("OPENSHELL_TEST_PROBE_CHILD_CAPS").is_none() {
+            return;
+        }
+
+        assert!(
+            capctl::caps::bounding::probe().is_empty(),
+            "child CapBnd should be empty after exec"
+        );
+    }
+
+    #[test]
     fn drop_privileges_noop_when_no_user_or_group() {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: None,
@@ -1130,7 +1946,63 @@ mod tests {
             run_as_group: Some(current_group.name),
         });
 
-        assert!(drop_privileges(&policy).is_ok());
+        let result = drop_privileges(&policy);
+        #[cfg(target_os = "linux")]
+        {
+            if nix::unistd::geteuid().is_root() && !capability_bounding_set_clear_available() {
+                let msg = format!("{}", result.unwrap_err());
+                assert!(
+                    msg.contains("Failed to clear child capability bounding set"),
+                    "unexpected failure: {msg}"
+                );
+                return;
+            }
+        }
+        assert!(result.is_ok(), "drop_privileges failed: {result:?}");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    fn drop_privileges_clears_bounding_set_for_spawned_child_when_permitted() {
+        use std::os::unix::process::CommandExt;
+
+        if !capability_bounding_set_clear_available() {
+            eprintln!(
+                "skipping: CAP_SETPCAP is not effective and the capability bounding set is nonempty"
+            );
+            return;
+        }
+
+        let current_group = Group::from_gid(nix::unistd::getegid())
+            .expect("getgrgid")
+            .expect("current group entry");
+
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: None,
+            run_as_group: Some(current_group.name),
+        });
+
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("current exe"));
+        cmd.arg("capability_probe_child")
+            .arg("--nocapture")
+            .env("OPENSHELL_TEST_PROBE_CHILD_CAPS", "1")
+            .stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::piped());
+
+        unsafe {
+            cmd.pre_exec(move || {
+                drop_privileges(&policy).map_err(|err| std::io::Error::other(err.to_string()))
+            });
+        }
+
+        let output = cmd.output().expect("spawn child status probe");
+        assert!(
+            output.status.success(),
+            "status probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -1400,10 +2272,11 @@ mod tests {
             return;
         }
 
-        let current_user = User::from_uid(nix::unistd::geteuid())
-            .unwrap()
-            .expect("current user entry");
-        let restricted_group = Group::from_gid(nix::unistd::Gid::from_raw(0))
+        let Ok(Some(current_user)) = User::from_uid(nix::unistd::geteuid()) else {
+            eprintln!("skipping: current UID has no /etc/passwd entry");
+            return;
+        };
+        let restricted_group = Group::from_gid(Gid::from_raw(0))
             .unwrap()
             .expect("gid 0 group entry");
         if restricted_group.gid == nix::unistd::getegid() {
@@ -1426,6 +2299,246 @@ mod tests {
         let after = std::fs::metadata(&existing).unwrap();
         assert_eq!(after.uid(), before.uid());
         assert_eq!(after.gid(), before.gid());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn chown_sandbox_home_changes_ownership_recursively() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("file.txt"), "hello").unwrap();
+        std::fs::create_dir(root.join("subdir")).unwrap();
+        std::fs::write(root.join("subdir").join("nested.txt"), "world").unwrap();
+
+        let expected_uid = nix::unistd::geteuid();
+        let expected_gid = nix::unistd::getegid();
+        chown_sandbox_home(&root, Some(expected_uid), Some(expected_gid)).unwrap();
+
+        for path in &[
+            root.clone(),
+            root.join("file.txt"),
+            root.join("subdir"),
+            root.join("subdir").join("nested.txt"),
+        ] {
+            let meta = std::fs::metadata(path).unwrap();
+            assert_eq!(meta.uid(), expected_uid.as_raw());
+            assert_eq!(meta.gid(), expected_gid.as_raw());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chown_sandbox_home_rejects_symlink_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real");
+        let link = dir.path().join("link");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let err = chown_sandbox_home(
+            &link,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chown_sandbox_home_skips_symlink_children() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+        let target = dir.path().join("outside");
+        std::fs::write(&target, "secret").unwrap();
+        symlink(&target, root.join("link")).unwrap();
+
+        chown_sandbox_home(
+            &root,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+        )
+        .expect("symlink children should be skipped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chown_recursive_skips_erofs_subtree_but_continues_siblings() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+
+        let readonly_dir = root.join("ro-mount");
+        std::fs::create_dir(&readonly_dir).unwrap();
+        std::fs::write(readonly_dir.join("child-under-ro.txt"), "data").unwrap();
+        std::fs::write(root.join("writable-sibling.txt"), "data").unwrap();
+
+        let chowned = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&chowned);
+        let readonly_dir_for_chown = readonly_dir.clone();
+        let fake_chown =
+            move |path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
+                if path == readonly_dir_for_chown {
+                    return Err(nix::errno::Errno::EROFS);
+                }
+                observed.lock().unwrap().push(path.to_path_buf());
+                Ok(())
+            };
+
+        chown_children(
+            &root,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+            &fake_chown,
+        )
+        .expect("read-only subtree should be skipped");
+
+        let chowned = chowned.lock().unwrap();
+        assert!(
+            !chowned.contains(&readonly_dir.join("child-under-ro.txt")),
+            "children under EROFS directory must not be traversed"
+        );
+        assert!(
+            chowned.contains(&root.join("writable-sibling.txt")),
+            "writable sibling should still be chowned"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chown_recursive_propagates_non_erofs_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+        let fake_chown = |_path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
+            Err(nix::errno::Errno::EPERM)
+        };
+
+        let result = chown_recursive(
+            &root,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+            &fake_chown,
+        );
+        assert!(result.is_err(), "non-EROFS errors should propagate");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_passwd_modifies_existing_sandbox_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let passwd = dir.path().join("passwd");
+        std::fs::write(
+            &passwd,
+            "root:x:0:0:root:/root:/bin/bash\nsandbox:x:1000:1000::/sandbox:/bin/bash\n",
+        )
+        .unwrap();
+
+        rewrite_passwd_at(&passwd, "5000", "6000").unwrap();
+
+        let content = std::fs::read_to_string(&passwd).unwrap();
+        assert!(content.contains("sandbox:x:5000:6000::/sandbox:/bin/bash"));
+        assert!(content.contains("root:x:0:0:root:/root:/bin/bash"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_passwd_appends_when_no_sandbox_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let passwd = dir.path().join("passwd");
+        std::fs::write(&passwd, "root:x:0:0:root:/root:/bin/bash\n").unwrap();
+
+        rewrite_passwd_at(&passwd, "5000", "6000").unwrap();
+
+        let content = std::fs::read_to_string(&passwd).unwrap();
+        assert!(content.contains("root:x:0:0:root:/root:/bin/bash"));
+        assert!(content.contains("sandbox:x:5000:6000::/sandbox:/bin/sh"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_group_modifies_existing_sandbox_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = dir.path().join("group");
+        std::fs::write(&group, "root:x:0:\nsandbox:x:1000:\n").unwrap();
+
+        rewrite_group_at(&group, "6000").unwrap();
+
+        let content = std::fs::read_to_string(&group).unwrap();
+        assert!(content.contains("sandbox:x:6000:"));
+        assert!(content.contains("root:x:0:"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_group_appends_when_no_sandbox_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = dir.path().join("group");
+        std::fs::write(&group, "root:x:0:\n").unwrap();
+
+        rewrite_group_at(&group, "6000").unwrap();
+
+        let content = std::fs::read_to_string(&group).unwrap();
+        assert!(content.contains("root:x:0:"));
+        assert!(content.contains("sandbox:x:6000:"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_passwd_leaves_malformed_entry_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let passwd = dir.path().join("passwd");
+        // Only 3 fields — slice pattern should fall through instead of panic.
+        std::fs::write(&passwd, "sandbox:x:1000\n").unwrap();
+        rewrite_passwd_at(&passwd, "5000", "6000").unwrap();
+        let content = std::fs::read_to_string(&passwd).unwrap();
+        assert!(content.contains("sandbox:x:1000"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_group_leaves_malformed_entry_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = dir.path().join("group");
+        // Only 2 fields — slice pattern should fall through instead of panic.
+        std::fs::write(&group, "sandbox:x\n").unwrap();
+        rewrite_group_at(&group, "6000").unwrap();
+        let content = std::fs::read_to_string(&group).unwrap();
+        assert!(content.contains("sandbox:x"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_passwd_preserves_other_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let passwd = dir.path().join("passwd");
+        std::fs::write(
+            &passwd,
+            "root:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534:nobody:/:/usr/sbin/nologin\nsandbox:x:1000:1000::/sandbox:/bin/bash\n",
+        )
+        .unwrap();
+
+        rewrite_passwd_at(&passwd, "1234567", "1234567").unwrap();
+
+        let content = std::fs::read_to_string(&passwd).unwrap();
+        assert!(content.contains("root:x:0:0:root:/root:/bin/bash"));
+        assert!(content.contains("nobody:x:65534:65534:nobody:/:/usr/sbin/nologin"));
+        assert!(content.contains("sandbox:x:1234567:1234567::/sandbox:/bin/bash"));
+        assert_eq!(content.lines().count(), 3);
     }
 
     #[tokio::test]
@@ -1536,6 +2649,93 @@ mod tests {
             supervisor_identity_mount_target("/run/spire/spire-agent.sock")
                 .expect("dedicated subdirectory should be accepted"),
             Some(PathBuf::from("/run/spire"))
+        );
+    }
+
+    // ---- Numeric UID tests (Phase 2) ----
+
+    #[test]
+    fn drop_privileges_accepts_numeric_uid() {
+        // When running as non-root, a numeric UID/GID that matches the
+        // current process should succeed without any passwd lookup.
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+
+        let uid_raw = nix::unistd::geteuid().as_raw();
+        let gid_raw = nix::unistd::getegid().as_raw();
+
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(uid_raw.to_string()),
+            run_as_group: Some(gid_raw.to_string()),
+        });
+
+        assert!(
+            drop_privileges(&policy).is_ok(),
+            "should accept current process UID/GID as numeric strings"
+        );
+    }
+
+    #[test]
+    fn drop_privileges_numeric_uid_skips_initgroups() {
+        // When running as non-root with a numeric user but group matches,
+        // initgroups should not be called (guard: target_uid != geteuid()).
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+
+        let current_uid = nix::unistd::geteuid().as_raw();
+
+        // Use a different group name that exists (the current one).
+        let current_group = Group::from_gid(nix::unistd::getegid())
+            .expect("should resolve current group")
+            .expect("current group should exist");
+
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(current_uid.to_string()), // numeric UID, no passwd entry needed
+            run_as_group: Some(current_group.name),     // name-based group
+        });
+
+        assert!(
+            drop_privileges(&policy).is_ok(),
+            "should accept numeric UID with name-based group (initgroups guarded)"
+        );
+    }
+
+    #[test]
+    fn numeric_uid_privilege_drop_child() {
+        if std::env::var_os("OPENSHELL_TEST_NUMERIC_UID_CHILD").is_none() {
+            return;
+        }
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("999999".into()),
+            run_as_group: Some("999999".into()),
+        });
+        match drop_privileges(&policy) {
+            Ok(()) => {}
+            Err(e) => {
+                assert!(
+                    !e.to_string().contains("Failed to resolve user record"),
+                    "unexpected error for numeric UID without passwd entry: {e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn drop_privileges_numeric_uid_without_passwd_entry_skips_lookup() {
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("current exe"));
+        cmd.arg("numeric_uid_privilege_drop_child")
+            .arg("--nocapture")
+            .env("OPENSHELL_TEST_NUMERIC_UID_CHILD", "1")
+            .stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::piped());
+        let output = cmd.output().expect("spawn child");
+        assert!(
+            output.status.success(),
+            "numeric UID privilege drop child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

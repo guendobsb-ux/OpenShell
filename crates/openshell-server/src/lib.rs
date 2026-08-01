@@ -29,12 +29,16 @@ pub mod cli;
 mod compute;
 pub mod config_file;
 mod defaults;
+mod gateway_listener;
 mod grpc;
 mod http;
 mod inference;
+mod middleware;
 mod multiplex;
+mod otel_tracing;
 mod persistence;
 pub(crate) mod policy_store;
+mod provider_profile_sources;
 mod provider_refresh;
 mod readiness;
 mod sandbox_index;
@@ -49,15 +53,15 @@ mod tls;
 #[cfg(test)]
 pub(crate) mod tls_test_utils;
 pub mod tracing_bus;
+mod tracing_setup;
 mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
-use openshell_core::{ComputeDriverKind, Config, Error, Result};
-use serde::Deserialize;
+use openshell_core::{ComputeDriverKind, Config, Error, ObjectLabels, Result};
+use openshell_supervisor_middleware::MiddlewareRegistry;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
@@ -69,16 +73,26 @@ use tracing::{debug, error, info, warn};
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-use compute::{ComputeRuntime, DockerComputeConfig, VmComputeConfig};
+/// Serializes tests that assert on captured spans, which share one exporter.
+#[cfg(test)]
+pub(crate) static TEST_TRACING_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+use compute::ComputeRuntime;
+use gateway_listener::{BoundGatewayListener, GatewayListenerScope, bind_gateway_listeners};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router, service_http_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
-use openshell_driver_kubernetes::KubernetesComputeConfig;
 pub use persistence::Store;
 use sandbox_index::SandboxIndex;
 use sandbox_watch::SandboxWatchBus;
 pub use tls::TlsAcceptor;
 use tracing_bus::TracingLogBus;
+
+pub(crate) struct ServerStartupConfig {
+    pub config: Config,
+    pub config_file: Option<config_file::ConfigFile>,
+    pub guest_tls: Option<compute::driver_config::GuestTlsPaths>,
+}
 
 /// Server state shared across handlers.
 #[derive(Debug)]
@@ -123,6 +137,9 @@ pub struct ServerState {
     /// query session state to surface supervisor readiness.
     pub supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 
+    /// Validated built-in and operator-registered supervisor middleware.
+    pub middleware_registry: Arc<MiddlewareRegistry>,
+
     /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
     pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
 
@@ -144,6 +161,19 @@ pub struct ServerState {
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
+
+    /// Immutable gateway interceptor execution plan. `None` when disabled.
+    pub(crate) gateway_interceptors:
+        Option<openshell_gateway_interceptors::GatewayInterceptorRuntime>,
+
+    /// Gateway-local provider profile sources. User-imported profiles are read
+    /// on demand when the user source is configured.
+    pub(crate) provider_profile_sources: provider_profile_sources::ProviderProfileSources,
+
+    /// OIDC admin role name for workspace-level authorization.
+    /// Empty when OIDC is not configured — `authorize_workspace()` treats
+    /// every authenticated user as Platform Admin in that case.
+    pub admin_role: String,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -154,12 +184,7 @@ fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
 }
 
 fn is_benign_connection_close(error: &(dyn std::error::Error + 'static)) -> bool {
-    let msg = error.to_string();
-    msg.contains("connection closed")
-        || msg.contains("connection reset")
-        || msg.contains("connection error")
-        || msg.contains("error reading a body from connection")
-        || msg.contains("broken pipe")
+    openshell_core::transport_errors::is_expected_transport_close_error(error)
 }
 
 impl ServerState {
@@ -177,6 +202,10 @@ impl ServerState {
         oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
     ) -> Self {
         let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
+        let admin_role = config
+            .oidc
+            .as_ref()
+            .map_or_else(String::new, |oidc| oidc.admin_role.clone());
         Self {
             config,
             store,
@@ -189,11 +218,16 @@ impl ServerState {
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
+            middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
             sandbox_jwt_issuer: None,
             sandbox_jwt_authenticator: None,
             k8s_sa_authenticator: None,
             grpc_rate_limiter,
+            gateway_interceptors: None,
+            provider_profile_sources:
+                provider_profile_sources::ProviderProfileSources::with_default_sources(),
+            admin_role,
         }
     }
 }
@@ -205,17 +239,43 @@ impl ServerState {
 /// # Errors
 ///
 /// Returns an error if the server fails to start or encounters a fatal error.
-pub async fn run_server(
-    config: Config,
-    vm_config: VmComputeConfig,
-    docker_config: DockerComputeConfig,
-    config_file: Option<config_file::ConfigFile>,
+pub(crate) async fn run_server(
+    startup: ServerStartupConfig,
     tracing_log_bus: TracingLogBus,
 ) -> Result<()> {
+    let ServerStartupConfig {
+        config,
+        config_file,
+        guest_tls,
+    } = startup;
+
+    auth::descriptor_authz::init()
+        .map_err(|error| Error::config(format!("invalid gRPC authorization metadata: {error}")))?;
+
     let database_url = config.database_url.trim();
     if database_url.is_empty() {
         return Err(Error::config("database_url is required"));
     }
+
+    let middleware_registrations = config_file
+        .as_ref()
+        .map(|file| {
+            file.openshell
+                .supervisor
+                .middleware
+                .iter()
+                .map(Into::into)
+                .collect()
+        })
+        .unwrap_or_default();
+    let middleware_registry = Arc::new(
+        MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            middleware_registrations,
+        )
+        .await
+        .map_err(|error| Error::config(format!("middleware registration failed: {error}")))?,
+    );
 
     let store = Arc::new(Store::connect(database_url).await?);
 
@@ -240,11 +300,16 @@ pub async fn run_server(
     let sandbox_index = SandboxIndex::new();
     let sandbox_watch_bus = SandboxWatchBus::new();
     let supervisor_sessions = Arc::new(supervisor_session::SupervisorSessionRegistry::new());
+    let driver_startup = compute::driver_config::DriverStartupContext {
+        file: config_file.as_ref(),
+        guest_tls: guest_tls.as_ref(),
+        gateway_port: config.bind_address.port(),
+        gateway_tls_enabled: config.tls.is_some(),
+        endpoint_overrides: &config.compute_driver_endpoints,
+    };
     let compute = build_compute_runtime(
         &config,
-        &vm_config,
-        &docker_config,
-        config_file.as_ref(),
+        driver_startup,
         store.clone(),
         sandbox_index.clone(),
         sandbox_watch_bus.clone(),
@@ -252,6 +317,25 @@ pub async fn run_server(
         supervisor_sessions.clone(),
     )
     .await?;
+    let gateway_interceptors =
+        openshell_gateway_interceptors::initialize(config.gateway_interceptors.clone())
+            .await
+            .map_err(|e| {
+                Error::config(format!("gateway interceptor initialization failed: {e}"))
+            })?;
+    let provider_profile_sources = provider_profile_sources::ProviderProfileSources::from_config(
+        &config.provider_profile_sources,
+        gateway_interceptors.as_ref(),
+    )
+    .map_err(|err| {
+        Error::config(format!(
+            "provider profile source configuration failed: {err}"
+        ))
+    })?;
+    info!(
+        sources = ?provider_profile_sources.source_ids(),
+        "provider profile sources configured"
+    );
     let mut state = ServerState::new(
         config.clone(),
         store.clone(),
@@ -262,6 +346,9 @@ pub async fn run_server(
         supervisor_sessions,
         oidc_cache,
     );
+    state.middleware_registry = middleware_registry;
+    state.gateway_interceptors = gateway_interceptors;
+    state.provider_profile_sources = provider_profile_sources;
 
     // Load the gateway-minted sandbox JWT signing key when configured.
     // Optional so single-driver dev deployments without certgen continue
@@ -322,7 +409,8 @@ pub async fn run_server(
     if state.sandbox_jwt_issuer.is_some() && std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
         // Pod lookups and TokenReview identity checks must match the sandbox
         // namespace and service account used by the Kubernetes driver.
-        let kubernetes_config = kubernetes_config_for_k8s_sa_bootstrap(config_file.as_ref())?;
+        let kubernetes_config =
+            compute::driver_config::kubernetes_config_for_k8s_sa_bootstrap(config_file.as_ref())?;
         let sandbox_namespace = kubernetes_config.namespace;
         let sandbox_service_account = kubernetes_config.service_account_name;
         match kube::Client::try_default().await {
@@ -357,6 +445,14 @@ pub async fn run_server(
     // shutdown so the running compute state matches the persisted store.
     // Runs before watchers spawn so the watch loop sees the post-resume
     // snapshot on its first poll.
+    ensure_default_workspace(&store).await?;
+
+    let gateway_listeners = bind_gateway_listeners(
+        config.bind_address,
+        state.compute.gateway_listener_requirements(),
+    )
+    .await?;
+
     if let Err(err) = state.compute.resume_persisted_sandboxes().await {
         warn!(error = %err, "Failed to resume persisted sandboxes during startup");
     }
@@ -368,20 +464,6 @@ pub async fn run_server(
 
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
-
-    let mut extra_listener_addresses = config.extra_bind_addresses.clone();
-    extra_listener_addresses.extend_from_slice(state.compute.gateway_bind_addresses());
-    let gateway_listener_addresses =
-        gateway_listener_addresses(config.bind_address, &extra_listener_addresses);
-    let mut gateway_listeners = Vec::with_capacity(gateway_listener_addresses.len());
-    for address in gateway_listener_addresses {
-        let listener = TcpListener::bind(address)
-            .await
-            .map_err(|e| Error::transport(format!("failed to bind to {address}: {e}")))?;
-        let local_addr = listener.local_addr().unwrap_or(address);
-        info!(address = %local_addr, "Server listening");
-        gateway_listeners.push((listener, local_addr));
-    }
 
     // Bind the unauthenticated health endpoint on a separate port when configured.
     if let Some(health_bind_address) = config.health_bind_address {
@@ -451,10 +533,9 @@ pub async fn run_server(
 
     let mut listener_tasks = Vec::with_capacity(gateway_listeners.len());
     let enable_loopback_service_http = config.service_routing.enable_loopback_service_http;
-    for (listener, listen_addr) in gateway_listeners {
+    for listener in gateway_listeners {
         listener_tasks.push(tokio::spawn(serve_gateway_listener(
             listener,
-            listen_addr,
             service.clone(),
             tls_acceptor.clone(),
             enable_loopback_service_http,
@@ -481,45 +562,16 @@ pub async fn run_server(
     Ok(())
 }
 
-fn gateway_listener_addresses(
-    bind_address: SocketAddr,
-    extra_addresses: &[SocketAddr],
-) -> Vec<SocketAddr> {
-    let mut addresses = vec![bind_address];
-    for address in extra_addresses {
-        if !addresses
-            .iter()
-            .any(|existing| listener_covers(*existing, *address))
-        {
-            addresses.push(*address);
-        }
-    }
-    addresses
-}
-
-fn listener_covers(existing: SocketAddr, requested: SocketAddr) -> bool {
-    if existing == requested {
-        return true;
-    }
-    if existing.port() != requested.port() {
-        return false;
-    }
-
-    match (existing.ip(), requested.ip()) {
-        (std::net::IpAddr::V4(existing), std::net::IpAddr::V4(_)) => existing.is_unspecified(),
-        (std::net::IpAddr::V6(existing), std::net::IpAddr::V6(_)) => existing.is_unspecified(),
-        _ => false,
-    }
-}
-
 async fn serve_gateway_listener(
-    listener: TcpListener,
-    listen_addr: SocketAddr,
+    bound_listener: BoundGatewayListener,
     service: MultiplexService,
     tls_acceptor: Option<TlsAcceptor>,
     enable_loopback_service_http: bool,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let BoundGatewayListener { listener, spec } = bound_listener;
+    let listen_addr = spec.address;
+
     loop {
         let accepted = tokio::select! {
             changed = shutdown.changed() => {
@@ -538,11 +590,19 @@ async fn serve_gateway_listener(
                 continue;
             }
         };
+        let listener_scope = match stream.local_addr() {
+            Ok(local_addr) => spec.scope_for_local_addr(local_addr),
+            Err(e) => {
+                debug!(error = %e, client = %addr, listen = %listen_addr, "Failed to inspect accepted local address");
+                spec.scope
+            }
+        };
 
         spawn_gateway_connection(
             stream,
             addr,
             listen_addr,
+            listener_scope,
             service.clone(),
             tls_acceptor.clone(),
             enable_loopback_service_http,
@@ -603,14 +663,19 @@ fn allow_plaintext_service_http(
     enabled: bool,
     listen_addr: SocketAddr,
     peer_addr: SocketAddr,
+    listener_scope: GatewayListenerScope,
 ) -> bool {
-    enabled && listen_addr.ip().is_loopback() && peer_addr.ip().is_loopback()
+    enabled
+        && matches!(listener_scope, GatewayListenerScope::Primary)
+        && listen_addr.ip().is_loopback()
+        && peer_addr.ip().is_loopback()
 }
 
 fn spawn_gateway_connection(
     stream: TcpStream,
     addr: SocketAddr,
     listen_addr: SocketAddr,
+    listener_scope: GatewayListenerScope,
     service: MultiplexService,
     tls_acceptor: Option<TlsAcceptor>,
     enable_loopback_service_http: bool,
@@ -623,9 +688,13 @@ fn spawn_gateway_connection(
                         enable_loopback_service_http,
                         listen_addr,
                         addr,
+                        listener_scope,
                     ) =>
                 {
-                    if let Err(e) = service.serve_service_http(stream).await {
+                    if let Err(e) = service
+                        .serve_service_http_on_listener(stream, listener_scope)
+                        .await
+                    {
                         if is_benign_connection_close(e.as_ref()) {
                             debug!(error = %e, client = %addr, listen = %listen_addr, "Plaintext service HTTP connection closed");
                         } else {
@@ -634,7 +703,12 @@ fn spawn_gateway_connection(
                     }
                 }
                 Ok(ConnectionProtocol::PlainHttp) => {
-                    warn!(client = %addr, listen = %listen_addr, "Rejected plaintext HTTP on non-loopback gateway listener");
+                    warn!(
+                        client = %addr,
+                        listen = %listen_addr,
+                        scope = ?listener_scope,
+                        "Rejected plaintext HTTP on gateway listener"
+                    );
                 }
                 Ok(ConnectionProtocol::Tls | ConnectionProtocol::Unknown) => {
                     // acceptor.acceptor() snapshots the current TLS config;
@@ -644,7 +718,11 @@ fn spawn_gateway_connection(
                         Ok(tls_stream) => {
                             let peer_identity = multiplex::extract_peer_identity(&tls_stream);
                             if let Err(e) = service
-                                .serve_with_peer_identity(tls_stream, peer_identity)
+                                .serve_with_peer_identity_on_listener(
+                                    tls_stream,
+                                    peer_identity,
+                                    listener_scope,
+                                )
                                 .await
                             {
                                 if is_benign_connection_close(e.as_ref()) {
@@ -670,7 +748,7 @@ fn spawn_gateway_connection(
         });
     } else {
         tokio::spawn(async move {
-            if let Err(e) = service.serve(stream).await {
+            if let Err(e) = service.serve_on_listener(stream, listener_scope).await {
                 if is_benign_connection_close(e.as_ref()) {
                     debug!(error = %e, client = %addr, "Connection closed");
                 } else {
@@ -719,29 +797,23 @@ async fn terminate_signal() {
 #[allow(clippy::too_many_arguments)]
 async fn build_compute_runtime(
     config: &Config,
-    vm_config: &VmComputeConfig,
-    docker_config: &DockerComputeConfig,
-    file: Option<&config_file::ConfigFile>,
+    driver_startup: compute::driver_config::DriverStartupContext<'_>,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 ) -> Result<ComputeRuntime> {
-    let driver = configured_compute_driver(config, file)?;
+    let driver = configured_compute_driver(config, driver_startup)?;
     info!(driver = %driver.name(), "Using compute driver");
-    if let ConfiguredComputeDriver::Builtin(kind) = &driver {
-        warn_if_kubernetes_sandbox_jwt_expiry_disabled(config, *kind);
-    }
 
-    match driver {
+    let runtime = match driver {
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Kubernetes) => {
-            let mut k8s = kubernetes_config_from_file(file)?;
-            if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
-                k8s.workspace_default_storage_size = size;
-            }
+            warn_if_kubernetes_sandbox_jwt_expiry_disabled(config);
+            let k8s_config =
+                compute::driver_config::kubernetes_config_from_context(driver_startup)?;
             ComputeRuntime::new_kubernetes(
-                k8s,
+                k8s_config,
                 store,
                 sandbox_index,
                 sandbox_watch_bus,
@@ -749,32 +821,12 @@ async fn build_compute_runtime(
                 supervisor_sessions.clone(),
             )
             .await
-            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
-        ConfiguredComputeDriver::Builtin(ComputeDriverKind::Docker) => ComputeRuntime::new_docker(
-            config.clone(),
-            docker_config.clone(),
-            store,
-            sandbox_index,
-            sandbox_watch_bus,
-            tracing_log_bus,
-            supervisor_sessions,
-        )
-        .await
-        .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}"))),
-        ConfiguredComputeDriver::Builtin(ComputeDriverKind::Podman) => {
-            let mut podman = podman_config_from_file(file)?;
-            podman.gateway_port = config.bind_address.port();
-            if let Ok(p) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
-                podman.socket_path = PathBuf::from(p);
-            }
-            if let Ok(ip) = std::env::var("OPENSHELL_PODMAN_HOST_GATEWAY_IP") {
-                podman.host_gateway_ip = ip;
-            }
-            apply_podman_local_tls_defaults(config, &mut podman)?;
-
-            ComputeRuntime::new_podman(
-                podman,
+        ConfiguredComputeDriver::Builtin(ComputeDriverKind::Docker) => {
+            let docker_config = compute::driver_config::docker_config_from_context(driver_startup)?;
+            ComputeRuntime::new_docker(
+                config.clone(),
+                docker_config,
                 store,
                 sandbox_index,
                 sandbox_watch_bus,
@@ -782,10 +834,22 @@ async fn build_compute_runtime(
                 supervisor_sessions,
             )
             .await
-            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
+        }
+        ConfiguredComputeDriver::Builtin(ComputeDriverKind::Podman) => {
+            let podman_config = compute::driver_config::podman_config_from_context(driver_startup)?;
+            ComputeRuntime::new_podman(
+                podman_config,
+                store,
+                sandbox_index,
+                sandbox_watch_bus,
+                tracing_log_bus,
+                supervisor_sessions,
+            )
+            .await
         }
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Vm) => {
-            let endpoint = compute::vm::spawn(config, vm_config).await?;
+            let vm_config = compute::driver_config::vm_config_from_context(driver_startup)?;
+            let endpoint = compute::vm::spawn(config, &vm_config).await?;
             ComputeRuntime::new_remote_driver(
                 endpoint,
                 store,
@@ -795,16 +859,16 @@ async fn build_compute_runtime(
                 supervisor_sessions,
             )
             .await
-            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
-        ConfiguredComputeDriver::Remote(remote) => {
-            let RemoteComputeDriverSelection { name, socket_path } = remote;
+        ConfiguredComputeDriver::Remote { name } => {
+            let remote_config =
+                compute::driver_config::remote_driver_config_from_context(driver_startup, &name)?;
             info!(
                 driver = %name,
-                socket = %socket_path.display(),
+                socket = %remote_config.socket_path.display(),
                 "Using remote compute driver endpoint"
             );
-            let endpoint = compute::connect_remote_compute_driver(name, &socket_path)
+            let endpoint = compute::connect_remote_compute_driver(name, &remote_config.socket_path)
                 .await
                 .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
             ComputeRuntime::new_remote_driver(
@@ -816,117 +880,30 @@ async fn build_compute_runtime(
                 supervisor_sessions,
             )
             .await
-            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
-    }
-}
-
-/// Build a [`KubernetesComputeConfig`] from the file's
-/// `[openshell.drivers.kubernetes]` table merged with inheritable
-/// `[openshell.gateway]` defaults. Falls back to the driver's `Default`
-/// when no file is present.
-fn kubernetes_config_from_file(
-    file: Option<&config_file::ConfigFile>,
-) -> Result<KubernetesComputeConfig> {
-    let Some(file) = file else {
-        return Ok(KubernetesComputeConfig::default());
     };
-    let merged = config_file::driver_table(
-        ComputeDriverKind::Kubernetes,
-        &file.openshell.gateway,
-        file.openshell.drivers.get("kubernetes"),
-    );
-    merged
-        .try_into()
-        .map_err(|e| Error::config(format!("invalid [openshell.drivers.kubernetes] table: {e}")))
-}
 
-fn kubernetes_config_for_k8s_sa_bootstrap(
-    file: Option<&config_file::ConfigFile>,
-) -> Result<KubernetesComputeConfig> {
-    let Some(file) = file else {
-        return Err(Error::config(
-            "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled in-cluster",
-        ));
-    };
-    if !file.openshell.drivers.contains_key("kubernetes") {
-        return Err(Error::config(
-            "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled in-cluster",
-        ));
-    }
-    kubernetes_config_from_file(Some(file))
-}
-
-/// Same pattern as [`kubernetes_config_from_file`] but for Podman.
-fn podman_config_from_file(
-    file: Option<&config_file::ConfigFile>,
-) -> Result<openshell_driver_podman::PodmanComputeConfig> {
-    let Some(file) = file else {
-        return Ok(openshell_driver_podman::PodmanComputeConfig::default());
-    };
-    let merged = config_file::driver_table(
-        ComputeDriverKind::Podman,
-        &file.openshell.gateway,
-        file.openshell.drivers.get("podman"),
-    );
-    merged
-        .try_into()
-        .map_err(|e| Error::config(format!("invalid [openshell.drivers.podman] table: {e}")))
-}
-
-fn apply_podman_local_tls_defaults(
-    config: &Config,
-    podman: &mut openshell_driver_podman::PodmanComputeConfig,
-) -> Result<()> {
-    if config.tls.is_none()
-        || podman.guest_tls_ca.is_some()
-        || podman.guest_tls_cert.is_some()
-        || podman.guest_tls_key.is_some()
-    {
-        return Ok(());
-    }
-
-    let Some(paths) = defaults::complete_local_tls_paths()
-        .map_err(|e| Error::config(format!("failed to resolve local TLS defaults: {e}")))?
-    else {
-        return Ok(());
-    };
-    podman.guest_tls_ca = Some(paths.ca);
-    podman.guest_tls_cert = Some(paths.client_cert);
-    podman.guest_tls_key = Some(paths.client_key);
-    Ok(())
+    runtime.map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
 }
 
 #[derive(Debug, Clone)]
 enum ConfiguredComputeDriver {
     Builtin(ComputeDriverKind),
-    Remote(RemoteComputeDriverSelection),
+    Remote { name: String },
 }
 
 impl ConfiguredComputeDriver {
     fn name(&self) -> &str {
         match self {
             Self::Builtin(kind) => kind.as_str(),
-            Self::Remote(remote) => &remote.name,
+            Self::Remote { name } => name,
         }
     }
 }
 
-#[derive(Debug, Clone)]
-struct RemoteComputeDriverSelection {
-    name: String,
-    socket_path: PathBuf,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RemoteComputeDriverConfig {
-    socket_path: PathBuf,
-}
-
 fn configured_compute_driver(
     config: &Config,
-    file: Option<&config_file::ConfigFile>,
+    driver_startup: compute::driver_config::DriverStartupContext<'_>,
 ) -> Result<ConfiguredComputeDriver> {
     match config.compute_drivers.as_slice() {
         [] => match openshell_core::config::detect_driver() {
@@ -939,7 +916,7 @@ fn configured_compute_driver(
                 set --drivers or OPENSHELL_DRIVERS to kubernetes, podman, docker, or vm",
             )),
         },
-        [driver] => resolve_configured_compute_driver(driver, config, file),
+        [driver] => resolve_configured_compute_driver(driver, driver_startup),
         drivers => Err(Error::config(format!(
             "multiple compute drivers are not supported yet; configured drivers: {}",
             drivers.join(",")
@@ -949,88 +926,109 @@ fn configured_compute_driver(
 
 fn resolve_configured_compute_driver(
     driver_name: &str,
-    config: &Config,
-    file: Option<&config_file::ConfigFile>,
+    driver_startup: compute::driver_config::DriverStartupContext<'_>,
 ) -> Result<ConfiguredComputeDriver> {
     let name = openshell_core::config::normalize_compute_driver_name(driver_name)
         .map_err(Error::config)?;
     let driver_kind = builtin_compute_driver(&name);
-    if let Some(socket_path) = config.compute_driver_endpoints.get(&name) {
-        if driver_kind.is_some() {
-            return Err(Error::config(format!(
-                "compute driver '{name}' is a reserved built-in driver and cannot be selected with a socket endpoint"
-            )));
-        }
-        return Ok(ConfiguredComputeDriver::Remote(
-            RemoteComputeDriverSelection {
-                name,
-                socket_path: socket_path.clone(),
-            },
-        ));
+    if driver_kind.is_some() && driver_startup.endpoint_overrides.contains_key(&name) {
+        return Err(Error::config(format!(
+            "compute driver '{name}' is a reserved built-in driver and cannot be selected with a socket endpoint"
+        )));
     }
 
     if let Some(kind) = driver_kind {
         return Ok(ConfiguredComputeDriver::Builtin(kind));
     }
 
-    let socket_path = remote_driver_socket_from_file(&name, file)?;
-    Ok(ConfiguredComputeDriver::Remote(
-        RemoteComputeDriverSelection { name, socket_path },
-    ))
+    Ok(ConfiguredComputeDriver::Remote { name })
 }
 
 fn builtin_compute_driver(name: &str) -> Option<ComputeDriverKind> {
     name.parse().ok()
 }
 
-fn remote_driver_socket_from_file(
-    name: &str,
-    file: Option<&config_file::ConfigFile>,
-) -> Result<PathBuf> {
-    let Some(file) = file else {
-        return Err(Error::config(format!(
-            "compute driver '{name}' is not a built-in driver; configure [openshell.drivers.{name}].socket_path or pass --drivers {name} with --compute-driver-socket"
-        )));
-    };
-    let Some(raw) = file.openshell.drivers.get(name) else {
-        return Err(Error::config(format!(
-            "compute driver '{name}' is not a built-in driver; configure [openshell.drivers.{name}].socket_path"
-        )));
-    };
-    let config = raw
-        .clone()
-        .try_into::<RemoteComputeDriverConfig>()
-        .map_err(|err| {
-            Error::config(format!(
-                "invalid [openshell.drivers.{name}] table for remote compute driver: {err}"
-            ))
-        })?;
-    Ok(config.socket_path)
+fn kubernetes_sandbox_jwt_expiry_disabled(config: &Config) -> bool {
+    config
+        .gateway_jwt
+        .as_ref()
+        .is_some_and(|jwt| jwt.ttl_secs == 0)
 }
 
-fn kubernetes_sandbox_jwt_expiry_disabled(config: &Config, driver: ComputeDriverKind) -> bool {
-    matches!(driver, ComputeDriverKind::Kubernetes)
-        && config
-            .gateway_jwt
-            .as_ref()
-            .is_some_and(|jwt| jwt.ttl_secs == 0)
-}
-
-fn warn_if_kubernetes_sandbox_jwt_expiry_disabled(config: &Config, driver: ComputeDriverKind) {
-    if kubernetes_sandbox_jwt_expiry_disabled(config, driver) {
+fn warn_if_kubernetes_sandbox_jwt_expiry_disabled(config: &Config) {
+    if kubernetes_sandbox_jwt_expiry_disabled(config) {
         warn!(
             "Kubernetes gateway configured with non-expiring sandbox JWTs (gateway_jwt.ttl_secs = 0); set ttl_secs > 0 for shared Kubernetes deployments"
         );
     }
 }
 
+pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
+    use grpc::workspace::{DEFAULT_WORKSPACE_NAME, WORKSPACE_OBJECT_TYPE};
+    use openshell_core::proto::Workspace;
+    use openshell_core::proto::datamodel::v1::ObjectMeta;
+    use prost::Message;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let workspace = Workspace {
+        metadata: Some(ObjectMeta {
+            id: id.clone(),
+            name: DEFAULT_WORKSPACE_NAME.to_string(),
+            created_at_ms: persistence::current_time_ms(),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            resource_version: 0,
+            workspace: String::new(),
+            deletion_timestamp_ms: 0,
+        }),
+        status: Some(openshell_core::proto::datamodel::v1::WorkspaceStatus {
+            phase: openshell_core::proto::datamodel::v1::WorkspacePhase::Active.into(),
+        }),
+    };
+
+    let labels_map = workspace.object_labels();
+    let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&labels_map).map_err(|e| Error::Config {
+                message: format!("failed to serialize labels: {e}"),
+            })?,
+        )
+    };
+    match store
+        .put_if(
+            WORKSPACE_OBJECT_TYPE,
+            &id,
+            DEFAULT_WORKSPACE_NAME,
+            "",
+            &workspace.encode_to_vec(),
+            labels_json.as_deref(),
+            persistence::WriteCondition::MustCreate,
+        )
+        .await
+    {
+        Ok(_) => {
+            info!("Created default workspace");
+            Ok(())
+        }
+        Err(persistence::PersistenceError::UniqueViolation { .. }) => {
+            debug!("Default workspace already exists");
+            Ok(())
+        }
+        Err(e) => Err(Error::config(format!(
+            "failed to ensure default workspace: {e}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfiguredComputeDriver, ConnectionProtocol, MultiplexService, ServerState, TlsAcceptor,
-        allow_plaintext_service_http, classify_initial_bytes, configured_compute_driver,
-        gateway_listener_addresses, is_benign_tls_handshake_failure,
-        kubernetes_config_for_k8s_sa_bootstrap, kubernetes_sandbox_jwt_expiry_disabled,
+        BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, GatewayListenerScope,
+        MultiplexService, ServerState, TlsAcceptor, allow_plaintext_service_http,
+        bind_gateway_listeners, classify_initial_bytes, configured_compute_driver,
+        is_benign_tls_handshake_failure, kubernetes_sandbox_jwt_expiry_disabled,
         serve_gateway_listener,
     };
     use openshell_core::{
@@ -1039,15 +1037,34 @@ mod tests {
     };
     use std::io::{Error, ErrorKind};
     use std::net::SocketAddr;
-    use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use std::time::Duration;
     use tempfile::{TempDir, tempdir};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::watch;
 
-    use crate::tls_test_utils::{generate_test_certs_with_ca, install_rustls_provider};
+    use crate::{
+        compute::GatewayListenerRequirement,
+        gateway_listener::GatewayListenerSpec,
+        tls_test_utils::{generate_test_certs_with_ca, install_rustls_provider},
+    };
+
+    fn test_driver_startup<'a>(
+        config: &'a Config,
+        file: Option<&'a super::config_file::ConfigFile>,
+    ) -> crate::compute::driver_config::DriverStartupContext<'a> {
+        crate::compute::driver_config::DriverStartupContext {
+            file,
+            guest_tls: None,
+            gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
+            gateway_tls_enabled: false,
+            endpoint_overrides: &config.compute_driver_endpoints,
+        }
+    }
 
     fn test_tls_acceptor() -> (TempDir, TlsAcceptor) {
         install_rustls_provider();
@@ -1110,8 +1127,10 @@ mod tests {
         let (tls_dir, tls_acceptor) = test_tls_acceptor();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(serve_gateway_listener(
-            listener,
-            listen_addr,
+            BoundGatewayListener {
+                listener,
+                spec: GatewayListenerSpec::new(listen_addr, GatewayListenerScope::Primary),
+            },
             service,
             Some(tls_acceptor),
             enable_loopback_service_http,
@@ -1147,7 +1166,7 @@ mod tests {
 
     fn service_request(addr: SocketAddr, extra_headers: &[(&str, &str)]) -> String {
         let mut request = format!(
-            "GET / HTTP/1.1\r\nHost: my-sandbox--web.dev.openshell.localhost:{}\r\nConnection: close\r\n",
+            "GET / HTTP/1.1\r\nHost: default--my-sandbox--web.dev.openshell.localhost:{}\r\nConnection: close\r\n",
             addr.port()
         );
         for (name, value) in extra_headers {
@@ -1208,11 +1227,23 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:54000".parse().unwrap();
         let wildcard: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         let remote_peer: SocketAddr = "192.0.2.10:54000".parse().unwrap();
+        let primary = GatewayListenerScope::Primary;
+        let callback = GatewayListenerScope::ComputeDriverCallback;
 
-        assert!(allow_plaintext_service_http(true, loopback, peer));
-        assert!(!allow_plaintext_service_http(false, loopback, peer));
-        assert!(!allow_plaintext_service_http(true, wildcard, peer));
-        assert!(!allow_plaintext_service_http(true, loopback, remote_peer));
+        assert!(allow_plaintext_service_http(true, loopback, peer, primary));
+        assert!(!allow_plaintext_service_http(
+            false, loopback, peer, primary
+        ));
+        assert!(!allow_plaintext_service_http(true, wildcard, peer, primary));
+        assert!(!allow_plaintext_service_http(
+            true,
+            loopback,
+            remote_peer,
+            primary
+        ));
+        assert!(!allow_plaintext_service_http(
+            true, loopback, peer, callback
+        ));
     }
 
     #[tokio::test]
@@ -1278,7 +1309,7 @@ mod tests {
         let (addr, shutdown, handle, _tls_dir) =
             start_tls_gateway_listener("127.0.0.1:0", true).await;
         let origin = format!(
-            "http://my-sandbox--web.dev.openshell.localhost:{}",
+            "http://default--my-sandbox--web.dev.openshell.localhost:{}",
             addr.port()
         );
         let response = send_plain_http(
@@ -1344,7 +1375,7 @@ mod tests {
         // Empty drivers triggers auto-detection, which may return Some or None
         // depending on the environment. This test verifies the auto-detection path
         // is taken rather than immediately returning an error.
-        let result = configured_compute_driver(&config, None);
+        let result = configured_compute_driver(&config, test_driver_startup(&config, None));
         // Either we get a detected driver or an error about none being detected.
         match result {
             Ok(ConfiguredComputeDriver::Builtin(driver)) => {
@@ -1358,8 +1389,8 @@ mod tests {
                     "auto-detected unexpected driver: {driver:?}"
                 );
             }
-            Ok(ConfiguredComputeDriver::Remote(remote)) => {
-                panic!("auto-detection returned remote driver: {remote:?}");
+            Ok(ConfiguredComputeDriver::Remote { name }) => {
+                panic!("auto-detection returned remote driver: {name}");
             }
             Err(e) => {
                 assert!(
@@ -1375,7 +1406,8 @@ mod tests {
     fn configured_compute_driver_rejects_multiple_entries() {
         let config = Config::new(None)
             .with_compute_drivers([ComputeDriverKind::Kubernetes, ComputeDriverKind::Podman]);
-        let err = configured_compute_driver(&config, None).unwrap_err();
+        let err =
+            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap_err();
         assert!(
             err.to_string()
                 .contains("multiple compute drivers are not supported yet")
@@ -1386,7 +1418,8 @@ mod tests {
     #[test]
     fn configured_compute_driver_accepts_podman() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Podman]);
-        let driver = configured_compute_driver(&config, None).unwrap();
+        let driver =
+            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap();
         assert!(matches!(
             driver,
             ConfiguredComputeDriver::Builtin(ComputeDriverKind::Podman)
@@ -1396,7 +1429,8 @@ mod tests {
     #[test]
     fn configured_compute_driver_accepts_vm() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Vm]);
-        let driver = configured_compute_driver(&config, None).unwrap();
+        let driver =
+            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap();
         assert!(matches!(
             driver,
             ConfiguredComputeDriver::Builtin(ComputeDriverKind::Vm)
@@ -1406,7 +1440,8 @@ mod tests {
     #[test]
     fn configured_compute_driver_accepts_docker() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Docker]);
-        let driver = configured_compute_driver(&config, None).unwrap();
+        let driver =
+            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap();
         assert!(matches!(
             driver,
             ConfiguredComputeDriver::Builtin(ComputeDriverKind::Docker)
@@ -1414,28 +1449,15 @@ mod tests {
     }
 
     #[test]
-    fn configured_compute_driver_resolves_named_remote_from_file() {
-        let file: super::config_file::ConfigFile = toml::from_str(
-            r#"
-[openshell.gateway]
-compute_drivers = ["kyma"]
-
-[openshell.drivers.kyma]
-socket_path = "/run/openshell/kyma.sock"
-"#,
-        )
-        .unwrap();
+    fn configured_compute_driver_resolves_named_remote() {
         let config = Config::new(None).with_compute_drivers(["kyma"]);
 
-        let driver = configured_compute_driver(&config, Some(&file)).unwrap();
+        let driver =
+            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap();
 
         match driver {
-            ConfiguredComputeDriver::Remote(remote) => {
-                assert_eq!(remote.name, "kyma");
-                assert_eq!(
-                    remote.socket_path,
-                    PathBuf::from("/run/openshell/kyma.sock")
-                );
+            ConfiguredComputeDriver::Remote { name } => {
+                assert_eq!(name, "kyma");
             }
             ConfiguredComputeDriver::Builtin(other) => {
                 panic!("expected remote driver, got builtin driver {other:?}")
@@ -1449,7 +1471,8 @@ socket_path = "/run/openshell/kyma.sock"
             .with_compute_drivers([ComputeDriverKind::Vm])
             .with_compute_driver_endpoint("vm", "/run/openshell/vm.sock");
 
-        let err = configured_compute_driver(&config, None).unwrap_err();
+        let err =
+            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap_err();
 
         assert!(
             err.to_string()
@@ -1464,7 +1487,8 @@ socket_path = "/run/openshell/kyma.sock"
             .with_compute_drivers([ComputeDriverKind::Docker])
             .with_compute_driver_endpoint("docker", "/run/openshell/docker.sock");
 
-        let err = configured_compute_driver(&config, None).unwrap_err();
+        let err =
+            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap_err();
 
         assert!(
             err.to_string()
@@ -1474,7 +1498,7 @@ socket_path = "/run/openshell/kyma.sock"
     }
 
     #[test]
-    fn kubernetes_sandbox_jwt_expiry_disabled_warns_only_for_kubernetes_zero_ttl() {
+    fn kubernetes_sandbox_jwt_expiry_disabled_warns_for_zero_ttl() {
         fn config_with_jwt_ttl(ttl_secs: u64) -> Config {
             let mut config = Config::new(None);
             config.gateway_jwt = Some(openshell_core::GatewayJwtConfig {
@@ -1488,86 +1512,47 @@ socket_path = "/run/openshell/kyma.sock"
         }
 
         assert!(kubernetes_sandbox_jwt_expiry_disabled(
-            &config_with_jwt_ttl(0),
-            ComputeDriverKind::Kubernetes
+            &config_with_jwt_ttl(0)
         ));
         assert!(!kubernetes_sandbox_jwt_expiry_disabled(
-            &config_with_jwt_ttl(3600),
-            ComputeDriverKind::Kubernetes
+            &config_with_jwt_ttl(3600)
         ));
-        assert!(!kubernetes_sandbox_jwt_expiry_disabled(
-            &config_with_jwt_ttl(0),
-            ComputeDriverKind::Docker
-        ));
-        assert!(!kubernetes_sandbox_jwt_expiry_disabled(
-            &Config::new(None),
-            ComputeDriverKind::Kubernetes
-        ));
+        assert!(!kubernetes_sandbox_jwt_expiry_disabled(&Config::new(None)));
     }
 
-    #[test]
-    fn k8s_sa_bootstrap_rejects_missing_kubernetes_driver_config() {
-        let err = kubernetes_config_for_k8s_sa_bootstrap(None).unwrap_err();
-        assert!(err.to_string().contains("[openshell.drivers.kubernetes]"));
+    #[tokio::test]
+    async fn failed_gateway_listener_bind_does_not_attempt_persisted_sandbox_resume() {
+        let occupied_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let occupied_address = occupied_listener.local_addr().unwrap();
+        let resume_attempted = AtomicBool::new(false);
+        let primary_address: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-        let file: crate::config_file::ConfigFile =
-            toml::from_str("[openshell.gateway]\n").expect("valid config");
-        let err = kubernetes_config_for_k8s_sa_bootstrap(Some(&file)).unwrap_err();
-        assert!(err.to_string().contains("[openshell.drivers.kubernetes]"));
-    }
+        let result: openshell_core::Result<()> = async {
+            let _listeners = bind_gateway_listeners(
+                primary_address,
+                &[docker_listener_requirement(occupied_address)],
+            )
+            .await?;
+            resume_attempted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        .await;
 
-    #[test]
-    fn k8s_sa_bootstrap_uses_configured_namespace_and_service_account() {
-        let file: crate::config_file::ConfigFile = toml::from_str(
-            r#"
-[openshell.gateway]
-
-[openshell.drivers.kubernetes]
-namespace = "sandboxes"
-service_account_name = "sandbox-sa"
-"#,
-        )
-        .expect("valid config");
-
-        let cfg = kubernetes_config_for_k8s_sa_bootstrap(Some(&file)).unwrap();
-        assert_eq!(cfg.namespace, "sandboxes");
-        assert_eq!(cfg.service_account_name, "sandbox-sa");
-    }
-
-    #[test]
-    fn podman_config_reads_bind_mount_opt_in_from_driver_table() {
-        let file: crate::config_file::ConfigFile = toml::from_str(
-            r"
-[openshell.drivers.podman]
-enable_bind_mounts = true
-",
-        )
-        .expect("valid config");
-
-        let cfg = crate::podman_config_from_file(Some(&file)).expect("podman config");
-
-        assert!(cfg.enable_bind_mounts);
-    }
-
-    #[test]
-    fn gateway_listener_addresses_skip_driver_address_covered_by_wildcard() {
-        let primary: SocketAddr = "0.0.0.0:8080".parse().unwrap();
-        let docker: SocketAddr = "172.18.0.1:8080".parse().unwrap();
-
-        assert_eq!(
-            gateway_listener_addresses(primary, &[docker, docker]),
-            vec![primary]
+        assert!(
+            result.is_err(),
+            "binding the occupied extra gateway address should fail"
+        );
+        assert!(
+            !resume_attempted.load(Ordering::SeqCst),
+            "persisted sandbox resume must not run before every gateway listener is bound"
         );
     }
 
-    #[test]
-    fn gateway_listener_addresses_include_driver_address_on_distinct_ip() {
-        let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let docker: SocketAddr = "172.18.0.1:8080".parse().unwrap();
-
-        assert_eq!(
-            gateway_listener_addresses(primary, &[docker, docker]),
-            vec![primary, docker]
-        );
+    fn docker_listener_requirement(address: SocketAddr) -> GatewayListenerRequirement {
+        GatewayListenerRequirement::Exact {
+            address,
+            driver_name: "docker".to_string(),
+            reason: "managed bridge".to_string(),
+        }
     }
 }

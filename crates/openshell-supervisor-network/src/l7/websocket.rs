@@ -545,6 +545,7 @@ fn inspect_websocket_text_message(
         target: inspector.target.clone(),
         query_params: inspector.query_params.clone(),
         graphql: None,
+        jsonrpc: None,
     };
     let (allowed, reason) = evaluate_l7_request(inspector.engine, inspector.ctx, &request_info)?;
     let decision = match (allowed, inspector.enforcement) {
@@ -581,6 +582,7 @@ fn inspect_graphql_websocket_message(
                 target: inspector.target.clone(),
                 query_params: inspector.query_params.clone(),
                 graphql: None,
+                jsonrpc: None,
             };
             emit_websocket_l7_event(
                 host,
@@ -602,6 +604,7 @@ fn inspect_graphql_websocket_message(
                 target: inspector.target.clone(),
                 query_params: inspector.query_params.clone(),
                 graphql: Some(graphql.clone()),
+                jsonrpc: None,
             };
             let parse_error_reason = graphql
                 .error
@@ -1270,9 +1273,7 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
-            activity_tx: None,
-            dynamic_credentials: None,
-            token_grant_resolver: None,
+            ..Default::default()
         };
         let (mut client_write, mut relay_read) = tokio::io::duplex(MAX_TEXT_MESSAGE_BYTES + 1024);
         let (mut relay_write, mut upstream_read) = tokio::io::duplex(MAX_TEXT_MESSAGE_BYTES + 1024);

@@ -33,6 +33,13 @@ struct TestOpenShell;
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn get_current_user(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetCurrentUserRequest>,
+    ) -> Result<Response<openshell_core::proto::GetCurrentUserResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn health(
         &self,
         _request: tonic::Request<HealthRequest>,
@@ -41,6 +48,13 @@ impl OpenShell for TestOpenShell {
             status: ServiceStatus::Healthy.into(),
             version: "test".to_string(),
         }))
+    }
+
+    async fn get_gateway_info(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetGatewayInfoRequest>,
+    ) -> Result<Response<openshell_core::proto::GetGatewayInfoResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn create_sandbox(
@@ -476,6 +490,55 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<Self::ForwardTcpStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
+
+    async fn create_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::CreateWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::CreateWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::GetWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_workspaces(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListWorkspacesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListWorkspacesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn add_workspace_member(
+        &self,
+        _request: tonic::Request<openshell_core::proto::AddWorkspaceMemberRequest>,
+    ) -> Result<Response<openshell_core::proto::AddWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn remove_workspace_member(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RemoveWorkspaceMemberRequest>,
+    ) -> Result<Response<openshell_core::proto::RemoveWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_workspace_members(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListWorkspaceMembersRequest>,
+    ) -> Result<Response<openshell_core::proto::ListWorkspaceMembersResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
 }
 
 async fn run_server(
@@ -668,6 +731,7 @@ async fn gateway_add_mtls_loopback_explicit_name_does_not_fallback_to_openshell_
 
 #[tokio::test]
 async fn cli_connects_with_client_cert() {
+    let _env = EnvVarGuard::set(&[]);
     install_rustls_provider();
 
     let (ca, ca_key) = build_ca();
@@ -741,6 +805,7 @@ async fn run_server_no_client_auth(
 
 #[tokio::test]
 async fn cli_connects_with_gateway_insecure() {
+    let _env = EnvVarGuard::set(&[]);
     install_rustls_provider();
 
     let (ca, ca_key) = build_ca();

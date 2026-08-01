@@ -801,15 +801,14 @@ network_policies:
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
             secret_resolver: None,
-            activity_tx: None,
-            dynamic_credentials: None,
-            token_grant_resolver: None,
+            ..Default::default()
         };
         let request_info = crate::l7::L7RequestInfo {
             action: req.action,
             target: req.target,
             query_params: req.query_params,
             graphql: Some(info),
+            jsonrpc: None,
         };
 
         let tunnel_engine = engine
